@@ -1,6 +1,7 @@
 third_party/dx-samples/
 third_party/agility-sdk/
 third_party/FidelityFX-SDK/
+third_party/d3d12_headers/
 build/*
 !build/msvc_env.sh
 *.obj
