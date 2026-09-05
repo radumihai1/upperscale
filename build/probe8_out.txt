@@ -1,0 +1,5 @@
+create readback 589824 B COPY_DEST: 0x00000000
+map right after create (COPY_DEST), range={0,-1}: 0x80070057
+map right after create (COPY_DEST), range={0,BYTES}: 0x00000000
+map after GPU CopyBufferRegion write: 0x00000000
+  first byte = AB (expect AB)

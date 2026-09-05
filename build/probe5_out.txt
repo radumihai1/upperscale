@@ -1,0 +1,10 @@
+device on adapter[1]: 0x00000000
+  buffer DEFAULT COMMON                    -> 0x00000000
+  buffer DEFAULT GENERIC_READ              -> 0x00000000
+  buffer UPLOAD COMMON                     -> 0x00000000
+  buffer UPLOAD GENERIC_READ               -> 0x00000000
+  buffer READBACK COMMON                   -> 0x00000000
+  buffer READBACK GENERIC_READ             -> 0x80070057
+  tex DEFAULT COPY_DEST                    -> 0x00000000
+  tex DEFAULT COMMON                       -> 0x00000000
+  buffer UPLOAD (Layout=UNKNOWN)           -> 0x80070057

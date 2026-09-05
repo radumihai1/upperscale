@@ -1,0 +1,2 @@
+M3 create UPLOAD 2D tex (ROW_MAJOR): 0x80070057
+M2 buffer(PlacedFootprint)->tex : removed=0x00000000

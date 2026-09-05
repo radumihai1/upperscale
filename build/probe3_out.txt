@@ -1,0 +1,13 @@
+=== xgpu_probe3: cross-node sharing capability ===
+  adapter[0] LUID=00000000:00027214  AMD Radeon RX 9060 XT
+  adapter[1] LUID=00000000:0002a089  AMD Radeon RX 7900 XTX
+  adapter[2] LUID=00000000:00034ea8  AMD Radeon RX 9060 XT
+  adapter[3] LUID=00000000:0002a034  Microsoft Basic Render Driver
+  GPU_A          CrossNodeSharingTier=0  CrossAdapterRowMajorTextureSupported=0
+  GPU_B          CrossNodeSharingTier=0  CrossAdapterRowMajorTextureSupported=0
+  GPU_A CreateCommittedResource(ALLOW_CROSS_ADAPTER) -> 0x80070057
+  GPU_A CreateCommittedResource(TEXTURE+ALLOW_CROSS_ADAPTER) -> 0x80070057
+  GPU_B CreateCommittedResource(ALLOW_CROSS_ADAPTER) -> 0x80070057
+  GPU_B CreateCommittedResource(TEXTURE+ALLOW_CROSS_ADAPTER) -> 0x80070057
+  NOTE: IDXGIAffinityFactory not present in Windows SDK 10.0.26100 headers.
+=== done ===

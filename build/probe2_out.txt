@@ -1,0 +1,35 @@
+== Cross-adapter heap tests (7900 XTX) ==
+  CUSTOM L0 + SHARED_XADAPTER                   CreateHeap: OK
+      placed BUFFER (xadapter flag): FAIL
+      hr=0x80070057
+      placed TEXTURE2D RGBA8 (xadapter flag): FAIL
+      hr=0x80070057
+      committed TEXTURE2D (xadapter): FAIL
+      hr=0x80070057
+== Control: plain shared heap (same adapter) ==
+  DEFAULT + SHARED (no xadapter)                CreateHeap: OK
+      placed BUFFER (xadapter flag): FAIL
+      hr=0x80070057
+      placed TEXTURE2D RGBA8 (xadapter flag): FAIL
+      hr=0x80070057
+      committed TEXTURE2D (xadapter): FAIL
+      hr=0x80070057
+== Control: default shared heap ==
+  DEFAULT + SHARED                              CreateHeap: OK
+      placed BUFFER (xadapter flag): FAIL
+      hr=0x80070057
+      placed TEXTURE2D RGBA8 (xadapter flag): FAIL
+      hr=0x80070057
+      committed TEXTURE2D (xadapter): FAIL
+      hr=0x80070057
+== Variant: DEFAULT + SHARED_CROSS_ADAPTER ==
+  DEFAULT + SHARED_XADAPTER                     CreateHeap: OK
+      placed BUFFER (xadapter flag): FAIL
+      hr=0x80070057
+      placed TEXTURE2D RGBA8 (xadapter flag): FAIL
+      hr=0x80070057
+      committed TEXTURE2D (xadapter): FAIL
+      hr=0x80070057
+== Variant: CUSTOM L0 WC (write-combine) + SHARED_CROSS_ADAPTER ==
+  CUSTOM L0 WC + SHARED_XADAPTER                CreateHeap: FAIL
+      hr=0x80070057
