@@ -71,9 +71,10 @@ put — only inputs cross A->B. Investigate how the target game's swapchain/pres
 design. This determines 1 vs 2 bounces per frame.
 
 ## REPO LAYOUT
-- third_party/FidelityFX-SDK/   — AMD official SDK clone. Signed FSR4 DLLs in Kits/FidelityFX/signedbin/:
-  amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll, amd_fidelityfx_framegeneration_dx12.dll.
-  Headers in Kits/FidelityFX/api/include/. HLSL FG source (optical flow / interp / inpaint) also present.
+- third_party/FidelityFX-SDK/   — AMD official SDK clone (GITIGNORED — not in git; it's a full repo itself).
+  If missing, re-clone: `git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git third_party/FidelityFX-SDK`.
+  Signed FSR4 DLLs in Kits/FidelityFX/signedbin/: amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll,
+  amd_fidelityfx_framegeneration_dx12.dll. Headers in Kits/FidelityFX/api/include/. HLSL FG source also present.
 - third_party/dx-samples/       — Microsoft DirectX-Graphics-Samples clone (D3D12LinkedGpus = reference; uses affinity layer).
 - tools/device_probe.cpp        — enumerate DXGI adapters, print LUIDs, create D3D12 device by LUID. WORKS.
 - tools/xgpu_test.cpp           — original cross-adapter attempt. OBSOLETE (cross-adapter dead); keep for history.
