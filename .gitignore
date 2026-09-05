@@ -1,4 +1,5 @@
 third_party/dx-samples/
 third_party/agility-sdk/
+third_party/FidelityFX-SDK/
 build/*.exe
 *.obj
