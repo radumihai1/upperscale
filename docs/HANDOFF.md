@@ -1,7 +1,8 @@
 # UPPERSCALE — HANDOFF / NEXT STEPS (read this first when resuming)
 
 Single source of truth for picking up work in a fresh session. Keep it updated as you go, then commit+push.
-Last updated after the cross-GPU transfer path was VALIDATED working (xgpu_probe4 PASS).
+Last updated after TASK 5 (cross-GPU ffxDispatch) was COMPLETED + VERIFIED: ACTIVE mode runs real FSR4 on GPU B,
+output parity vs passive control confirmed (RMS diff 0.0217 @ 512x288->768x432).
 
 ## FINAL GOAL
 A Windows tool ("upperscale") that lets **GPU A** do the heavy raster rendering of a game while
@@ -47,6 +48,21 @@ These are real driver behaviors, NOT header bugs or test mistakes. All confirmed
    transitioned to COPY_SOURCE before CopyTextureRegion/CopyBufferRegion.
 4. **`D3D12_RESOURCE_DESC.SampleDesc.Count` MUST be set to 1** for buffers too — a zero-initialized desc has
    Count=0 and CreateCommittedResource returns E_INVALIDARG (this silently broke every buffer in early probes).
+5. **`Reset()` on a FRESH command list returns E_FAIL (0x80004005) but the list is still fully usable** — Close
+   succeeds, commands execute correctly (verified tools/xgpu_probe15_reset_efail.cpp + barrier probes; probe4 always worked because
+   it ignored the HRESULT). Pattern: `SafeReset()` wrapper that logs once and continues. NEVER treat a failed Reset
+   as fatal on this box.
+6. **`D3D12_RESOURCE_STATE_ALL_BARRIERS` (0x80000000) is REJECTED in legacy transition barriers** — Close() fails
+   with E_INVALIDARG (verified tools/xgpu_probe16_barrier_allbarr.cpp). Must track each resource's actual state explicitly and use
+   concrete StateBefore values. Escape hatch for "unknown current state": a transition from `COMMON(0)` is accepted
+   even when the real state differs (driver does not validate; verified xgpu_probe18 case g: Close=0). Use it after
+   FFX has executed on our mirrors, whose final state we cannot see.
+7. **UAV barriers / transitions into UAV state are rejected for resources created WITHOUT
+   `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`** (E_INVALIDARG at Close — standard D3D12 rule, but it bit us twice:
+   our B-side mirrors AND the test's game textures). FFX records its OWN internal transitions into whatever command
+   list we hand it and WILL use resources as UAVs. Every texture that FFX may touch (mirrors + any resource passed in
+   a dispatch desc) must be created with `ALLOW_UNORDERED_ACCESS | ALLOW_RENDER_TARGET`. Real games set these flags;
+   our mirrors now do too (GetOrCreateMirror).
 
 ## ✅ CORE ASSUMPTION PROVEN (ffx_bindtest PASS on BOTH GPUs)
 tools/ffx_bindtest.cpp loads the REAL signed `amd_fidelityfx_upscaler_dx12.dll` (FSR4 v4.1.1), creates a
@@ -83,15 +99,44 @@ the effect DLLs (upscaler/framegeneration) — see build/smoke/ for the working 
 Config (env or upperscale.ini [proxy] in CWD): UPPERSCALE_ENABLE, UPPERSCALE_GPU_LUID(_HI),
 UPPERSCALE_REAL_LOADER, UPPERSCALE_LOG (0 off / 1 create+destroy / 2 verbose). Log -> <CWD>\upperscale.log.
 
-⚠️ KNOWN LIMITATION (task 5 pending): in ACTIVE mode ffxDispatch is NOT yet wired for cross-GPU transfer —
-the context is bound to GPU B but the game's command list + input textures live on GPU A, so forwarding would
-be undefined behavior. The proxy therefore returns FFX_API_RETURN_ERROR from dispatch in active mode (logged).
-Use PASSTHROUGH for real-game testing until task 5 lands.
-
 ⚠️ Windows DLL search order gotcha (cost a debug cycle): LoadLibraryA("name.dll") searches the EXE's own dir
 before CWD. When running ffx_smoke.exe, put it in the SAME dir as our proxy + real loader, or pass an explicit
 UPPERSCALE_REAL_LOADER path. The proxy itself resolves its bundled real-loader relative to ITS OWN module dir
 (GetModuleFileNameA(g_hInst)), which is correct for the drop-in case (proxy sits next to the game's DLLs).
+
+## ✅ TASK 5 DONE: CROSS-GPU ffxDispatch WORKS END-TO-END (ACTIVE mode)
+src/proxy/upperscale_xgpu.{h,cpp} (~670 lines) implements the whole cross-GPU dispatch in one call
+(`xgpuInterceptDispatch`), called from the proxy's ffxDispatch in ACTIVE mode. Per upscale dispatch:
+1. For each non-null input (color/depth/MV/exposure/reactive/transparency): synchronous RAM bounce A->B —
+   barrier to COPY_SOURCE on our own GPU-A CL, T2T into readback buffer (PLACED_FOOTPRINT), fence+wait,
+   Map/memcpy into B upload buffer, T2T into a cached B-side mirror texture, restore declared state.
+2. Output: FFX is pointed at a B-side mirror of the game's output texture instead of the original.
+3. We hand FFX OUR GPU-B command list (SafeReset'd); real ffxDispatch records compute into it; we append an
+   output readback to the SAME open list, Close+execute on our GPU-B queue, fence+wait.
+4. CPU hop: rbB -> next slot of a 3-slot A-side UPLOAD ring (game may still be executing N-1's copy-back).
+5. Copy-back is recorded into the GAME'S command list (still open mid-recording) with symmetric barriers around
+   its declared state; desc fields are restored exactly afterwards (per-field wasSwapped tracking).
+
+VERIFIED (tools/ffx_dispatchtest.exe, 512x288 RGBA16F+D32+R16G16F -> 768x432):
+- PASSIVE control (FFX on GPU A): rc=0, all 331776 output px non-zero.
+- ACTIVE (FFX on GPU B via proxy): rc=0, all px non-zero; per-pixel diff vs passive: RMS 0.0217, max 0.98 at
+  528/331776 px (>0.01) — normal cross-GPU float precision noise. Cross-GPU FSR4 output is correct.
+- Per-frame timing (steady state): inputs ~4.6ms, ffx_record ~6.8ms (first call includes shader compile: 1.2s),
+  capture+copyback ~1.4ms => ~13ms total @512x288. Synchronous v1 — task 6 pipelines this.
+
+Test gotcha found while verifying: the test originally passed its command list to ffxDispatch WITHOUT resetting it
+after a prior execute (real games reset every frame) -> FFX recorded into an already-executed list -> passive mode
+crashed at ExecuteCommandLists. Fixed in the test; not a proxy bug.
+
+## SDK 10.0.26100 TYPE DIFFERENCES (this box's um/d3d12.h — grep before assuming)
+- `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` (NOT the modern short name `D3D12_PLACED_FOOTPRINT`).
+- No `DXGI_FORMAT_R32G8X24_UINT` constant.
+- `GetCopyableFootprints(desc, sub0, count, baseOffset, fp[], rows[], rowPitch[], sliceSize[])` — the OLD signature
+  (UINT* rows, UINT64* pitch/slice), not the modern single-total form.
+- No named `D3D12_RESOURCE_STATE_ALL_BARRIERS` constant (#define it as 0x80000000 if you need the value at all —
+  but see quirk #6: this driver rejects it in barriers anyway).
+- Barrier union member is `UAV` (uppercase), not `Uav`.
+- `D3D12_RESOURCE_ALIASING_BARRIER` has NO State member in this header.
 
 ## ✅ EXPORT TABLE (all 3 effect DLLs identical)
 tools/dump_exports.cpp (rewritten to read PE from disk — LoadLibraryExA is unreliable here) shows each of
@@ -141,6 +186,13 @@ design. This determines 1 vs 2 bounces per frame.
 - src/proxy/upperscale_proxy.cpp + .def — **THE PROXY DLL** -> build/amd_fidelityfx_dx12.dll. 5 FFX exports, config
   (env/ini), logging, passthrough + active device-swap modes. BUILT + SMOKE-PASS. (.def kept for reference; link here
   rejects .def files with LNK1107 — exports come from __declspec(dllexport) instead.)
+- src/proxy/upperscale_xgpu.{h,cpp} — **CROSS-GPU TRANSFER HUB** (task 5). RAM-bounce A<->B, mirror cache, one-shot
+  dispatch intercept. BUILT into the same DLL; verified end-to-end by ffx_dispatchtest.
+- tools/ffx_dispatchtest.cpp — **END-TO-END DISPATCH TEST.** Simulates a game on GPU A (textures + fill), loads our
+  proxy, runs ffxCreateContext+ffxDispatch through it in ACTIVE or passive mode, reads the output back and checks
+  non-zero pixels. Run from build/smoke/: `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_dispatchtest.exe A out.bin`.
+- tools/xgpu_probe15..19.cpp — driver-quirk isolation probes (Reset E_FAIL on fresh lists, ALL_BARRIERS/UAV rejection,
+  COMMON(0) escape hatch, full bounce pattern). Keep as reference for quirks #5-#7.
 - docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh. build/smoke/ = working proxy test dir.
 
 ## BUILD COMMAND THAT WORKS (git-bash, MSVC 14.51 BuildTools)
@@ -177,16 +229,18 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 1. [x] Validate cross-GPU transfer path — DONE (probe4 PASS, ~1.3ms one-way @512x288).
 2. [x] De-risk: real signed FSR4 upscaler binds to a LUID device — DONE (ffx_bindtest PASS both GPUs).
 3. [x] Build src/proxy/ DLL skeleton + export table + passthrough/active modes — DONE (smoke PASS both modes).
-4. [ ] **WIRE ffxDispatch cross-GPU transfer (THE NEXT BUILD).** In ACTIVE mode, on each dispatch: read the game's
-   input textures (color/depth/MV, resident on GPU A) via the validated RAM bounce (PLACED_FOOTPRINT copy -> readback
-   buffer -> Map/memcpy -> upload texture on B), build a B-resident ffxDispatchDescUpscale with our own command list +
-   fence on GPU B, call the real upscaler's dispatch, then return the output. The game's `output` resource is on GPU A —
-   we must write FSR4's result back to it (second bounce B->A) OR present from B (see OPEN QUESTION). Validate parity vs a
-   single-GPU run. This unblocks ACTIVE mode end-to-end.
-5. [ ] **Resolve OPEN QUESTION** (output present path): does the game present from GPU A or B? Determines 1 vs 2 bounces/frame.
-6. [ ] Add frame-generation path on GPU B + double/triple buffering to hide copy latency + end-to-end latency measurement.
+4. [x] **WIRE ffxDispatch cross-GPU transfer** — DONE (task 5; see "TASK 5 DONE" section above). ACTIVE mode runs
+   real FSR4 on GPU B with verified output parity vs passive control.
+5. [ ] **Task 6: frame generation + pipelining.** Add the FG dispatch types to xgpuInterceptDispatch
+   (ffxDispatchDescFrameGenerationPrep / FrameGeneration — inputs depth+MV, outputs interpolation texture; see
+   ffx_framegeneration.h and fsrapirendermodule.cpp lines ~1490-1650 for the exact field lists). Then make the
+   input bounce async: record A-side readback into the game's CL (or our own) without waiting, so GPU B can start
+   frame N+1 while CPU is still hopping frame N. Keep the 3-slot output ring; add per-frame latency stats to log.
+6. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B? Determines
+   whether the copy-back into the game's CL is even needed in steady state. (v1 always copies back — safe either way.)
 7. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write the ini the proxy reads at load.
-8. [ ] End-to-end test in a real FSR-enabled game; capture before/after frames; document added latency.
+8. [ ] End-to-end test in a real FSR-enabled game (Cyberpunk 2077 confirmed to ship amd_fidelityfx_dx12.dll in its bin/);
+   capture before/after frames; document added latency.
 9. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
 
 ## STATUS SNAPSHOT (as of last update)
@@ -197,8 +251,11 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 - Cross-GPU transfer is a CPU RAM bounce (readback->memcpy->upload), ~1.3ms one-way @512x288. Driver quirks documented above.
 - **ffx_bindtest PASS both GPUs** — real signed FSR4 v4.1.1 binds to LUID-selected device. Core architecture proven.
 - **Proxy DLL BUILT + SMOKE-PASS (both PASSTHROUGH and ACTIVE modes).** build/amd_fidelityfx_dx12.dll exports the 5 FFX
-  symbols; active mode swaps backend device to GPU B by LUID. ffxDispatch in active mode returns ERROR until task 4 lands.
-- Active next task = **wire ffxDispatch cross-GPU transfer** (task 4 above). Everything before it is done and verified.
+  symbols; active mode swaps backend device to GPU B by LUID.
+- **TASK 5 DONE: cross-GPU ffxDispatch verified end-to-end** — ACTIVE mode bounces inputs A->B, runs real FSR4 on GPU B,
+  copies output back into the game's CL. Output parity vs passive control confirmed (RMS diff 0.0217). ~13ms/frame @512x288
+  synchronous v1. New driver quirks #5-#7 + SDK type differences documented above — read them before touching barriers.
+- Active next task = **task 6: FG dispatch types + async pipelining** (see NEXT STEPS item 5).
 
 ## DO / DON'T
 - DO kill any background test processes after verifying (user is sensitive to leftover servers).

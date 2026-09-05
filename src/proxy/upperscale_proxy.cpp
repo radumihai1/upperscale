@@ -6,12 +6,15 @@
 //   * In ACTIVE mode (config enabled): walks the pNext desc chain on create/query, finds the
 //     FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 node and SWAPS its ID3D12Device* for a
 //     device we created BY LUID on the user-selected GPU B. All FFX compute then runs on B.
-//   * In PASSTHROUGH mode (default): forwards everything untouched to AMD's real loader,
-//     which we load from a bundled copy (upperscale_real_loader.dll next to us) or an explicit
-//     path. This is the safe first in-game test: proves drop-in replacement works without
-//     changing where FFX runs.
-//   * Keeps per-context bookkeeping (original game device vs swapped device) for the upcoming
-//     cross-GPU dispatch transfer (task 5).
+//   * In ACTIVE mode ffxDispatch is fully wired (task 5): upperscale_xgpu.cpp RAM-bounces each
+//     input A->B, records FFX into our own GPU-B command list, executes it, captures the output
+//     back through RAM and copies it into the game's original output texture via the game's
+//     command list. The desc is restored exactly before returning.
+//   * In PASSTHROUGH mode (default): forwards everything untouched to AMD's real loader, which
+//     we load from a bundled copy (upperscale_real_loader.dll next to us) or an explicit path.
+//     This is the safe first in-game test: proves drop-in replacement works without changing
+//     where FFX runs.
+//   * Keeps per-context bookkeeping (original game device vs swapped device + transfer hub).
 //
 // Config (env vars, read at DllMain; ini fallback upperscale.ini in CWD):
 //   UPPERSCALE_ENABLE=1            enable active mode (device swap)
@@ -19,18 +22,8 @@
 //   UPPERSCALE_GPU_LUID_HI=<hex>   high part (default 0)
 //   UPPERSCALE_REAL_LOADER=<path>  path to AMD's real loader DLL (default: upperscale_real_loader.dll next to us)
 //   UPPERSCALE_LOG=<0|1|2>         0=off, 1=create/destroy only (default), 2+=verbose per-call
-//
-// NOTE (task 5 pending): in ACTIVE mode ffxDispatch is NOT yet wired for cross-GPU transfer.
-// Calling it would record GPU-A resources on a GPU-B-bound context (undefined behavior).
-// The proxy therefore logs and returns FFX_API_RETURN_ERROR instead of forwarding. Use
-// PASSTHROUGH mode for real-game testing until dispatch wiring lands.
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <d3d12.h>
-#include <dxgi1_6.h>
-#include <combaseapi.h>
-#include <stdint.h>
+#include "upperscale_xgpu.h"   // windows.h + d3d12/dxgi + FFX SDK headers in the right order
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -40,6 +33,8 @@
 #pragma comment(lib, "dxgi.lib")
 
 // ---- FFX API (ABI from AMD's public headers; we only need the 5 entry points + desc layout) ----
+// Deliberately local typedefs instead of including ffx_api.h: that header declares its entry
+// points with __declspec(dllexport), which collides with our own definitions in this DLL (C2733).
 typedef void* ffxContext;
 typedef uint32_t ffxReturnCode_t;
 #define FFX_API_RETURN_OK                     0u
@@ -87,8 +82,8 @@ static char              g_logPath[512]{};
 static FILE*             g_log = nullptr;
 static int               g_swapsDone = 0;
 
-// context bookkeeping for task 5: ffxContext -> original game device (GPU A)
-struct CtxInfo { ffxContext ctx; ID3D12Device* origDev; };
+// context bookkeeping for task 5: ffxContext -> original game device (GPU A) + transfer hub
+struct CtxInfo { ffxContext ctx; ID3D12Device* origDev; XGpuHub* hub; };
 #define MAX_TRACKED_CTX 64
 static CtxInfo g_ctxTable[MAX_TRACKED_CTX];      // small fixed table, no heap in render path
 
@@ -264,11 +259,24 @@ static int SwapBackendDevice(ffxApiHeader* head, ID3D12Device** origOut) {
 // ---- Context table helpers (advisory; task 5 keys on ffxContext properly) ----
 static void CtxTrack(ffxContext ctx, ID3D12Device* orig) {
     for (int i = 0; i < MAX_TRACKED_CTX; ++i)
-        if (!g_ctxTable[i].ctx && ctx) { g_ctxTable[i].ctx = ctx; g_ctxTable[i].origDev = orig; return; }
+        if (!g_ctxTable[i].ctx && ctx) { g_ctxTable[i].ctx = ctx; g_ctxTable[i].origDev = orig; g_ctxTable[i].hub = nullptr; return; }
 }
 static void CtxUntrack(ffxContext ctx) {
     for (int i = 0; i < MAX_TRACKED_CTX; ++i)
-        if (g_ctxTable[i].ctx == ctx) { g_ctxTable[i].ctx = nullptr; g_ctxTable[i].origDev = nullptr; }
+        if (g_ctxTable[i].ctx == ctx) {
+            XGpuHub* hub = g_ctxTable[i].hub;
+            // only release the hub if no other tracked context still uses it (hubs are shared per device pair)
+            int stillUsed = 0;
+            for (int j = 0; j < MAX_TRACKED_CTX; ++j)
+                if (j != i && g_ctxTable[j].hub == hub) { stillUsed = 1; break; }
+            if (hub && !stillUsed) xgpuReleaseHub(hub);
+            g_ctxTable[i].ctx = nullptr; g_ctxTable[i].origDev = nullptr; g_ctxTable[i].hub = nullptr;
+        }
+}
+static CtxInfo* CtxFind(ffxContext ctx) {
+    for (int i = 0; i < MAX_TRACKED_CTX; ++i)
+        if (g_ctxTable[i].ctx == ctx) return &g_ctxTable[i];
+    return nullptr;
 }
 
 // ---- DllMain ----
@@ -293,7 +301,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     return TRUE;
 }
 
-// ---- The 5 exported FFX entry points ----
+// ---- The 5 exported FFX entry points (signatures match AMD's ABI exactly — see ffx_api.h) ----
 extern "C" {
 
 ffxReturnCode_t __declspec(dllexport) ffxCreateContext(ffxContext* context, ffxApiHeader* desc, const void* memCb) {
@@ -302,7 +310,7 @@ ffxReturnCode_t __declspec(dllexport) ffxCreateContext(ffxContext* context, ffxA
     int swapped = SwapBackendDevice(desc, &origDev);   // no-op in passthrough mode
     if (g_cfg.logLevel >= 2) Log("ffxCreateContext topType=0x%llx swapped=%d", (unsigned long long)desc->type, swapped);
     if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
-    ffxReturnCode_t rc = g_pRealCreate(context, desc, memCb);
+    ffxReturnCode_t rc = g_pRealCreate(context, desc, memCb);   // memCb is an opaque const void* (ffxAllocationCallbacks*)
     LogAlways("ffxCreateContext: topType=0x%llx rc=%u swapped=%d ctx=%p", (unsigned long long)desc->type, rc, swapped, context ? *context : nullptr);
     if (rc == FFX_API_RETURN_OK && swapped) CtxTrack(*context, origDev);
     return rc;
@@ -312,7 +320,7 @@ ffxReturnCode_t __declspec(dllexport) ffxDestroyContext(ffxContext* context, con
     if (!context) return FFX_API_RETURN_ERROR_PARAMETER;
     if (g_cfg.logLevel >= 2) Log("ffxDestroyContext ctx=%p", *context);
     if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
-    ffxReturnCode_t rc = g_pRealDestroy(context, memCb);
+    ffxReturnCode_t rc = g_pRealDestroy(context, memCb);   // opaque const void* (ffxAllocationCallbacks*)
     LogAlways("ffxDestroyContext: rc=%u", rc);
     CtxUntrack(*context);
     return rc;
@@ -343,12 +351,28 @@ ffxReturnCode_t __declspec(dllexport) ffxQuery(ffxContext* context, ffxApiHeader
 
 ffxReturnCode_t __declspec(dllexport) ffxDispatch(ffxContext* context, const ffxApiHeader* desc) {
     if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
-    // TASK 5 PENDING: cross-GPU input transfer (color/depth/MV A->B via RAM bounce) is not wired yet.
-    // In ACTIVE mode the context is bound to GPU B but the game's command list + resources live on
-    // GPU A — forwarding would be undefined behavior. Refuse loudly instead of corrupting state.
+    // ACTIVE mode: route the dispatch through the cross-GPU transfer hub (task 5).
+    // The hub bounces inputs A->B via RAM, records FFX into our GPU-B command list, executes it,
+    // captures the output back to an A-side upload slot and records the copy-back into the game's
+    // original command list. Non-upscale dispatch types (FG prepare/present etc.) are forwarded
+    // untouched — they run on GPU B with B-side resources only when their inputs are also ours,
+    // which is not yet wired; forwarding them would mix devices, so we refuse those for now.
     if (g_cfg.enable && g_swapsDone > 0) {
-        LogAlways("ffxDispatch: ACTIVE mode without dispatch wiring — returning ERROR (task 5 pending). type=0x%llx", (unsigned long long)desc->type);
-        return FFX_API_RETURN_ERROR;
+        if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;   // need g_pRealDispatch for the intercept
+        CtxInfo* ci = CtxFind(*context);
+        ID3D12Device* origDev = ci ? ci->origDev : nullptr;
+        // Fallback: no tracked context (e.g. query-only flow) — cannot bounce without the game device.
+        if (!origDev) {
+            LogAlways("ffxDispatch: ACTIVE mode but no original device for ctx=%p — forwarding as-is", *context);
+        } else {
+            if (!ci->hub) ci->hub = xgpuGetOrCreateHub(origDev, GetGpuBDevice());
+            if (ci->hub) {
+                ffxReturnCode_t rc = xgpuInterceptDispatch(ci->hub, *context, desc, (void*)g_pRealDispatch);
+                if (g_cfg.logLevel >= 3) Log("ffxDispatch: intercepted type=0x%llx rc=%u", (unsigned long long)desc->type, rc);
+                return rc;
+            }
+            LogAlways("ERROR: xgpu hub creation failed — dispatch will be forwarded as-is (undefined behavior risk)");
+        }
     }
     if (g_cfg.logLevel >= 2) Log("ffxDispatch ctx=%p type=0x%llx", *context, (unsigned long long)desc->type);
     if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
