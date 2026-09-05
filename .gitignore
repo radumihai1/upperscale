@@ -1,0 +1,4 @@
+third_party/dx-samples/
+third_party/agility-sdk/
+build/*.exe
+*.obj
