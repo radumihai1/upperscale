@@ -48,6 +48,55 @@ These are real driver behaviors, NOT header bugs or test mistakes. All confirmed
 4. **`D3D12_RESOURCE_DESC.SampleDesc.Count` MUST be set to 1** for buffers too — a zero-initialized desc has
    Count=0 and CreateCommittedResource returns E_INVALIDARG (this silently broke every buffer in early probes).
 
+## ✅ CORE ASSUMPTION PROVEN (ffx_bindtest PASS on BOTH GPUs)
+tools/ffx_bindtest.cpp loads the REAL signed `amd_fidelityfx_upscaler_dx12.dll` (FSR4 v4.1.1), creates a
+D3D12 device BY LUID, and calls its `ffxCreateContext`. Result: **PASS on both GPU A (7900 XTX) and
+GPU B (9060 XT)** — context created rc=0, provider version query returns "4.1.1", clean destroy.
+This proves the whole architecture at the API level: we CAN bind FFX to a LUID-selected device.
+
+Key facts learned building it (do not rediscover):
+- The signed upscaler imports `amdxc64.dll` + `dxgi.dll` (AMD driver runtime) — present in System32, loads fine.
+- `ffxQuery(GET_VERSIONS)` is TWO-PHASE: call 1 with only `outputCount` set -> returns count; call 2 with
+  `versionIds`+`versionNames` arrays filled to get the ids/names. If you forget `outputCount`, count reads 0.
+- Available upscaler versions on this box: **4.1.1 (FSR4)**, 3.1.5, 2.3.4. Use id from version[0] in an
+  `ffxOverrideVersion` node chained into the create-desc for FSR4.
+- Create-desc chain a game builds: `ffxCreateContextDescUpscale -> [ffxOverrideVersion] -> ffxCreateBackendDX12Desc{device} -> (optional allocCallbacks)`. The `.device` in the backend node is THE POINTER WE SWAP to GPU B.
+- If you install custom resource-allocator callbacks, you MUST honor `pHeapProps->Type` (FFX requests UPLOAD for mappable buffers); forcing DEFAULT makes FFX crash inside create. Simplest: don't install alloc callbacks at all — let FFX use its own default allocator on the backend device (what real games do).
+
+## ✅ PROXY DLL SKELETON BUILT + VERIFIED (task 4b DONE)
+src/proxy/upperscale_proxy.cpp builds `build/amd_fidelityfx_dx12.dll` (drop-in for AMD's loader).
+Exports EXACTLY the 5 FFX symbols (+ internal upperscaleGetState helper). Two modes, both SMOKE-PASS:
+
+- **PASSTHROUGH** (default): forwards all 5 calls untouched to AMD's real loader (bundled as
+  `upperscale_real_loader.dll` next to us, or UPPERSCALE_REAL_LOADER path). Verified: FSR4 context
+  created on GPU A, provider "4.1.1", clean destroy — behaviorally identical to AMD's DLL. This is the
+  SAFE first in-game test (proves drop-in works without changing where FFX runs).
+- **ACTIVE** (UPPERSCALE_ENABLE=1 + UPPERSCALE_GPU_LUID=<hex>): walks the pNext desc chain on create/query,
+  finds the backend-DX12 node, SWAPS its ID3D12Device* for a device we created BY LUID on GPU B. Verified:
+  "created GPU-B device by LUID {0,27214}: AMD Radeon RX 9060 XT" + "SWAP: backend device A -> B", FSR4
+  context bound to GPU B rc=0, provider "4.1.1".
+
+tools/ffx_smoke.cpp is the harness (simulates a game on GPU A, loads our DLL, checks upperscaleGetState).
+Run it from a dir containing: amd_fidelityfx_dx12.dll (ours) + upperscale_real_loader.dll (AMD's loader) +
+the effect DLLs (upscaler/framegeneration) — see build/smoke/ for the working layout.
+
+Config (env or upperscale.ini [proxy] in CWD): UPPERSCALE_ENABLE, UPPERSCALE_GPU_LUID(_HI),
+UPPERSCALE_REAL_LOADER, UPPERSCALE_LOG (0 off / 1 create+destroy / 2 verbose). Log -> <CWD>\upperscale.log.
+
+⚠️ KNOWN LIMITATION (task 5 pending): in ACTIVE mode ffxDispatch is NOT yet wired for cross-GPU transfer —
+the context is bound to GPU B but the game's command list + input textures live on GPU A, so forwarding would
+be undefined behavior. The proxy therefore returns FFX_API_RETURN_ERROR from dispatch in active mode (logged).
+Use PASSTHROUGH for real-game testing until task 5 lands.
+
+⚠️ Windows DLL search order gotcha (cost a debug cycle): LoadLibraryA("name.dll") searches the EXE's own dir
+before CWD. When running ffx_smoke.exe, put it in the SAME dir as our proxy + real loader, or pass an explicit
+UPPERSCALE_REAL_LOADER path. The proxy itself resolves its bundled real-loader relative to ITS OWN module dir
+(GetModuleFileNameA(g_hInst)), which is correct for the drop-in case (proxy sits next to the game's DLLs).
+
+## ✅ EXPORT TABLE (all 3 effect DLLs identical)
+tools/dump_exports.cpp (rewritten to read PE from disk — LoadLibraryExA is unreliable here) shows each of
+loader/upscaler/framegeneration exports EXACTLY 5 symbols: `ffxConfigure, ffxCreateContext, ffxDestroyContext, ffxDispatch, ffxQuery`. Our proxy must export these same 5. The loader `LoadLibraryA`s effect DLLs by name (upscaler/FG/denoiser/radiancecache) — our proxy replicates that routing + adds the device swap.
+
 ## ARCHITECTURE (decided, transfer path now proven)
 DLL replacement (OptiScaler-proven pattern):
 1. Drop our `amd_fidelityfx_dx12.dll` into the game folder. Game loads it thinking it's AMD's.
@@ -83,9 +132,16 @@ design. This determines 1 vs 2 bounces per frame.
 - tools/xgpu_probe4.cpp         — **THE VALIDATED TRANSFER TEST.** RAM-bounce A->B round-trip, PASS + timing. WORKS.
 - tools/xgpu_probe5..14.cpp     — isolation probes that found the driver quirks (buffer state matrix, Map range,
   copy-type isolation, PLACED_FOOTPRINT fix). Keep as reference for the quirks section above.
-- tools/dump_exports.cpp        — list a DLL's exported functions via GetProcAddress. (build when needed)
-- src/proxy/                    — the actual proxy DLL goes here (NOT STARTED — this is the next build target).
-- docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh.
+- tools/dump_exports.cpp        — list a DLL's exported functions by reading its PE from disk (LoadLibraryExA is
+  unreliable here). WORKS. Output build/*_exports.txt.
+- tools/ffx_bindtest.cpp        — **CORE DE-RISK.** Loads the REAL signed upscaler DLL, creates device by LUID, calls
+  ffxCreateContext. PASS on both GPUs (build/ffx_bindtest.exe [A|B]). WORKS.
+- tools/ffx_smoke.cpp           — **PROXY SMOKE TEST.** Simulates a game on GPU A, loads our proxy DLL, verifies the
+  device swap (ACTIVE) / passthrough. PASS in both modes. Run from build/smoke/ layout. WORKS.
+- src/proxy/upperscale_proxy.cpp + .def — **THE PROXY DLL** -> build/amd_fidelityfx_dx12.dll. 5 FFX exports, config
+  (env/ini), logging, passthrough + active device-swap modes. BUILT + SMOKE-PASS. (.def kept for reference; link here
+  rejects .def files with LNK1107 — exports come from __declspec(dllexport) instead.)
+- docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh. build/smoke/ = working proxy test dir.
 
 ## BUILD COMMAND THAT WORKS (git-bash, MSVC 14.51 BuildTools)
 ```
@@ -119,23 +175,30 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 
 ## NEXT STEPS (in order)
 1. [x] Validate cross-GPU transfer path — DONE (probe4 PASS, ~1.3ms one-way @512x288).
-2. [ ] **Build src/proxy/:** DLL exporting the FFX loader symbols. First run tools/dump_exports.cpp on
-   amd_fidelityfx_loader_dx12.dll to get the exact export table (ffxCreateContext, ffxDispatch, etc.). Then implement
-   `ffxCreateContext` -> create GPU-B device by LUID from config, pass to real FFX context; keep game's GPU-A device ref.
-3. [ ] **Resolve OPEN QUESTION** (output present path): determine whether the game presents from GPU A or B, so we know if output needs a second B->A bounce. May need a real-game trace of swapchain creation.
-4. [ ] Wire cross-GPU input transfer into ffxDispatch: RAM-bounce color/depth/MV A->B (PLACED_FOOTPRINT copies + Map/memcpy), call real FSR4 upscaler DLL with B-resident resources, return output. Validate vs single-GPU run for parity.
-5. [ ] Add frame-generation path on GPU B (call amd_fidelityfx_framegeneration_dx12.dll) + double/triple buffering + end-to-end latency measurement.
-6. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write a small config the proxy reads at load.
-7. [ ] End-to-end test in a real FSR-enabled game; capture before/after frames; document added latency.
-8. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
+2. [x] De-risk: real signed FSR4 upscaler binds to a LUID device — DONE (ffx_bindtest PASS both GPUs).
+3. [x] Build src/proxy/ DLL skeleton + export table + passthrough/active modes — DONE (smoke PASS both modes).
+4. [ ] **WIRE ffxDispatch cross-GPU transfer (THE NEXT BUILD).** In ACTIVE mode, on each dispatch: read the game's
+   input textures (color/depth/MV, resident on GPU A) via the validated RAM bounce (PLACED_FOOTPRINT copy -> readback
+   buffer -> Map/memcpy -> upload texture on B), build a B-resident ffxDispatchDescUpscale with our own command list +
+   fence on GPU B, call the real upscaler's dispatch, then return the output. The game's `output` resource is on GPU A —
+   we must write FSR4's result back to it (second bounce B->A) OR present from B (see OPEN QUESTION). Validate parity vs a
+   single-GPU run. This unblocks ACTIVE mode end-to-end.
+5. [ ] **Resolve OPEN QUESTION** (output present path): does the game present from GPU A or B? Determines 1 vs 2 bounces/frame.
+6. [ ] Add frame-generation path on GPU B + double/triple buffering to hide copy latency + end-to-end latency measurement.
+7. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write the ini the proxy reads at load.
+8. [ ] End-to-end test in a real FSR-enabled game; capture before/after frames; document added latency.
+9. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
 
 ## STATUS SNAPSHOT (as of last update)
 - Repo at C:\Users\mrmih\Playground\AI\upperscale, git branch main. Remote origin = github radumihai1/upperscale
   (authed via credential manager). Pushed to origin/main; verify with `git ls-remote origin main` vs local HEAD.
 - FidelityFX SDK vendored (signed FSR4 DLLs present). dx-samples cloned.
-- device_probe WORKS. xgpu_probe3 WORKS (cross-adapter = NOT_SUPPORTED, tier 0). **xgpu_probe4 WORKS + PASS** (transfer validated).
+- device_probe WORKS. xgpu_probe3 WORKS (cross-adapter = NOT_SUPPORTED, tier 0). **xgpu_probe4 PASS** (transfer validated).
 - Cross-GPU transfer is a CPU RAM bounce (readback->memcpy->upload), ~1.3ms one-way @512x288. Driver quirks documented above.
-- Proxy DLL NOT started. Active next task = build src/proxy/ skeleton + dump the FFX loader export table.
+- **ffx_bindtest PASS both GPUs** — real signed FSR4 v4.1.1 binds to LUID-selected device. Core architecture proven.
+- **Proxy DLL BUILT + SMOKE-PASS (both PASSTHROUGH and ACTIVE modes).** build/amd_fidelityfx_dx12.dll exports the 5 FFX
+  symbols; active mode swaps backend device to GPU B by LUID. ffxDispatch in active mode returns ERROR until task 4 lands.
+- Active next task = **wire ffxDispatch cross-GPU transfer** (task 4 above). Everything before it is done and verified.
 
 ## DO / DON'T
 - DO kill any background test processes after verifying (user is sensitive to leftover servers).

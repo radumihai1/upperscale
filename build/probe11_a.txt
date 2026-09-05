@@ -1,1 +1,0 @@
-A) buffer->texture : removed=0x887A0001

@@ -1,4 +1,0 @@
-create readback COPY_DEST: 0x00000000
-map while COPY_DEST: 0x00000000
-map after barrier to GENERIC_READ: 0x00000000
-create readback COMMON: 0x887A0005

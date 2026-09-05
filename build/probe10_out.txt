@@ -1,4 +1,0 @@
-create texture: 0x00000000
-after upload->tex: GetDeviceRemovedReason=0x887A0001
-after tex->readback: GetDeviceRemovedReason=0x887A0001
-map readback: 0x887A0005
