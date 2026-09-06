@@ -66,6 +66,8 @@ struct XGpuHub {
 
     uint64_t              dispatches;
     double                msInputs, msFfxRecord, msCapture;  // running sums (ms)
+    double                msTotalMax;   // worst-case end-to-end ffxDispatch cost seen so far
+    double                msTotalEma;   // steady-state estimate (EMA alpha=0.1) — the number that matters for latency
 };
 
 // ---------------------------------------------------------------------------
@@ -251,6 +253,11 @@ void xgpuReleaseHub(XGpuHub* h) {
     if (h->qB) h->qB->Release();
     h->devA->Release();
     for (int i = 0; i < g_nHubs; ++i) if (g_hubs[i] == h) { g_hubs[i] = nullptr; --g_nHubs; }
+    if (h->dispatches > 0)
+        XLog("session summary: %llu dispatch(es), avg inputs=%.2fms ffx_record=%.2fms capture+copyback=%.2fms | frame_total ema=%.2fms max=%.2fms",
+             (unsigned long long)h->dispatches, h->msInputs / h->dispatches,
+             h->msFfxRecord / h->dispatches, h->msCapture / h->dispatches,
+             h->msTotalEma, h->msTotalMax);
     free(h);
 }
 
@@ -714,11 +721,17 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     h->msInputs += t1 - t0;
     h->msFfxRecord += t2 - t1;
     h->msCapture += t3 - t2;
-    if (h->dispatches % 60 == 1) {
-        XLog("stats #%llu: inputs=%.2fms ffx_record=%.2fms capture+copyback=%.2fms total=%.2fms",
+    // Per-frame latency: total is the end-to-end cost added to this frame's ffxDispatch call
+    // (v1 is fully synchronous, so it lands entirely on the game thread). EMA = steady-state
+    // estimate; max = worst case (first frames include shader compile + buffer growth).
+    double totalMs = t3 - t0;
+    if (totalMs > h->msTotalMax) h->msTotalMax = totalMs;
+    h->msTotalEma = (h->dispatches == 1) ? totalMs : h->msTotalEma * 0.9 + totalMs * 0.1;
+    if (h->dispatches <= 3 || h->dispatches % 60 == 1) {
+        XLog("stats #%llu: inputs=%.2f ffx_record=%.2f capture+copyback=%.2f | frame_total=%.2fms ema=%.2fms max=%.2fms",
              (unsigned long long)h->dispatches, h->msInputs / h->dispatches,
              h->msFfxRecord / h->dispatches, h->msCapture / h->dispatches,
-             (t3 - t0));
+             totalMs, h->msTotalEma, h->msTotalMax);
     }
 
 restore:

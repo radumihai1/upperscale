@@ -1,8 +1,0 @@
-LIBRARY upperscale_proxy
-EXPORTS
-    ffxCreateContext
-    ffxDestroyContext
-    ffxConfigure
-    ffxQuery
-    ffxDispatch
-    upperscaleGetState
