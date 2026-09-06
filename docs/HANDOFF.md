@@ -98,6 +98,12 @@ the effect DLLs (upscaler/framegeneration) — see build/smoke/ for the working 
 
 Config (env or upperscale.ini [proxy] in CWD): UPPERSCALE_ENABLE, UPPERSCALE_GPU_LUID(_HI),
 UPPERSCALE_REAL_LOADER, UPPERSCALE_LOG (0 off / 1 create+destroy / 2 verbose). Log -> <CWD>\upperscale.log.
+Env vars are read FIRST, then the ini OVERRIDES them if upperscale.ini exists in CWD — so a stale ini silently
+wins over env. tools/upperscale_config.exe (list/set/show) generates the ini; verified ini-only config works
+(no env needed). NOTE: the original ini parser had a bug — `stricmp(p,"[proxy]")` never matched because fgets
+leaves "\r\n" on the line, so inProxy stayed 0 and NO ini was ever parsed (env vars masked it in our tests).
+Fixed by stripping trailing CR/LF/whitespace before comparing. If you see mode=PASSTHROUGH despite a valid ini,
+check this.
 
 ⚠️ Windows DLL search order gotcha (cost a debug cycle): LoadLibraryA("name.dll") searches the EXE's own dir
 before CWD. When running ffx_smoke.exe, put it in the SAME dir as our proxy + real loader, or pass an explicit
@@ -224,6 +230,9 @@ design. This determines 1 vs 2 bounces per frame.
 - tools/ffx_fgtest.cpp — **END-TO-END FRAME GENERATION TEST (task 6a).** FG context + per-frame configure/PREPARE_V2/
   FRAMEGENERATION through the proxy; verifies the generated frame is non-zero. Run from build/smoke/:
   `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_fgtest.exe out_fg.bin [frames]`.
+- tools/upperscale_config.cpp — **CONFIG CLI (task 7a).** `list` (adapters+LUIDs), `set <idx|0xLUID> --dir <game>`
+  (writes upperscale.ini), `show`. Build → build/upperscale_config.exe. Verified: ini it writes makes the proxy
+  enter ACTIVE mode with no env vars set.
 - tools/xgpu_probe15..19.cpp — driver-quirk isolation probes (Reset E_FAIL on fresh lists, ALL_BARRIERS/UAV rejection,
   COMMON(0) escape hatch, full bounce pattern). Keep as reference for quirks #5-#7.
 - docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh. build/smoke/ = working proxy test dir.
@@ -273,10 +282,11 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 7. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B, and does it use
    the FG-swapchain context (which we do NOT intercept today)? Determines whether copy-back is needed in steady state
    and what extra interception the swapchain-context flow needs. (v1 always copies back — safe either way.)
-8. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write the ini the proxy reads at load.
+8. [x] **Config tool** — DONE: `tools/upperscale_config.cpp` → `upperscale_config.exe` (list / set / show).
+   Writes the `[proxy]` ini the proxy reads at load; verified end-to-end (ini-only, no env vars → mode=ACTIVE).
 9. [ ] End-to-end test in a real FSR-enabled game (Cyberpunk 2077 confirmed to ship amd_fidelityfx_dx12.dll in its bin/);
    capture before/after frames; document added latency.
-10. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
+10. [x] **README.md** — DONE (build/run/troubleshoot + why-this table). Push to https://github.com/radumihai1/upperscale.git
 
 ## STATUS SNAPSHOT (as of last update)
 - Repo at C:\Users\mrmih\Playground\AI\upperscale, git branch main. Remote origin = github radumihai1/upperscale
@@ -293,7 +303,11 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 - **TASK 6a DONE: FG dispatch types verified end-to-end** — PREPARE_V2 (depth+MV) and FRAMEGENERATION (presentColor ->
   outputs[0..3]) intercepted cross-GPU; ffx_fgtest PASS (5 frames, generated frame non-zero). Multi-output readback +
   12-slot output ring in place. FG version query gotcha documented above.
-- Active next task = **task 6b/6c: async pipelining + per-frame latency stats** (see NEXT STEPS item 6).
+- **TASK 7a DONE: config tool + README** — upperscale_config.exe (list/set/show) writes the [proxy] ini; fixed a real
+  bug where the proxy's ini parser never matched "[proxy]" (trailing \r\n), so ini config was silently dead until now.
+  Verified ini-only → mode=ACTIVE. README.md written (build/run/troubleshoot + why-this table).
+- Active next task = **task 6b/6c: async pipelining + per-frame latency stats** (see NEXT STEPS item 6), then the
+  real-game validation pass (item 9).
 
 ## DO / DON'T
 - DO kill any background test processes after verifying (user is sensitive to leftover servers).

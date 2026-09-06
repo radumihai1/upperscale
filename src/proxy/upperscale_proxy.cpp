@@ -138,13 +138,16 @@ static void LoadConfig() {
         char line[256];
         int inProxy = 0;
         while (fgets(line, sizeof(line), ini)) {
+            // strip trailing CR/LF/whitespace so "[proxy]\r\n" matches and values are clean.
+            for (int li = (int)strlen(line); li > 0 && (line[li-1]=='\r' || line[li-1]=='\n' || line[li-1]==' ' || line[li-1]=='\t'); ) line[--li] = 0;
             char* p = line; while (*p == ' ' || *p == '\t') ++p;
             if (!stricmp(p, "[proxy]")) { inProxy = 1; continue; }
-            if (p[0] == '[') { inProxy = 0; continue; }
-            if (!inProxy) continue;
+            if (p[0] == '[') { inProxy = 0; continue; }   // any other section ends [proxy]
+            if (!inProxy || !*p) continue;
             char key[64], val[192];
             if (sscanf(p, "%63[^=]=%191s", key, val) == 2) {
-                while (val[strlen(val)-1] == '\r' || val[strlen(val)-1] == '\n') val[strlen(val)-1] = 0;
+                // trim trailing whitespace from value (already stripped line-ending above).
+                while (*val && (val[strlen(val)-1]==' ' || val[strlen(val)-1]=='\t')) val[strlen(val)-1] = 0;
                 if (!stricmp(key, "enable")) g_cfg.enable = atoi(val);
                 else if (!stricmp(key, "gpu_luid_low")) g_cfg.luidLo = (ULONG)strtoul(val, nullptr, 16);
                 else if (!stricmp(key, "gpu_luid_high")) g_cfg.luidHi = (ULONG)strtoul(val, nullptr, 16);
