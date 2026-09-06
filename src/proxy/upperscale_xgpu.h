@@ -11,10 +11,11 @@
 // after, appends an output readback to the same list (keeps ordering on B), and records the
 // output copy-back into the GAME's original command list with symmetric barriers.
 //
-// v1 is fully synchronous: every bounce completes before ffxDispatch returns. Consequence in
-// single-submit engines: input textures are read before this frame's render passes have
-// executed, so FFX sees last-executed-frame inputs (a mutually consistent set -> coherent
-// temporal history, +1 frame latency). Task 6 replaces this with an async pipeline.
+// v1 is fully synchronous: every bounce completes before ffxDispatch returns (task 6b batches the
+// input bounces into one A-readback + one B-upload per dispatch). Consequence in single-submit
+// engines: input textures are read before this frame's render passes have executed, so FFX sees
+// last-executed-frame inputs (a mutually consistent set -> coherent temporal history, +1 frame
+// latency). A deeper async pipeline (overlapping the bounce with GPU work) is a future task.
 //
 // NOTE: this header deliberately does NOT include the FFX SDK headers — ffx_api.h declares its
 // entry points with __declspec(dllexport), which would collide with our own definitions in the
@@ -36,11 +37,13 @@ typedef struct XGpuHub XGpuHub;
 // Create/return the hub for this (gameDevice, gpuBDevice) pair. AddRefs gameDevice.
 XGpuHub* xgpuGetOrCreateHub(ID3D12Device* devA, ID3D12Device* devB);
 
-// Synchronously bounce one input resource from A to B: readback on our qA (barriers around the
-// declared state), CPU memcpy into the B upload buffer, upload into a cached B-side mirror.
-// On success sets res->resource to the B-side mirror and returns true. The caller must restore
-// the original pointer after ffxDispatch returns (FFX only records — it does not consume).
-bool xgpuBounceInput(XGpuHub* hub, FfxApiResource* res);
+// Synchronously bounce ALL input resources of one dispatch from A to B in a single batched pass:
+// ONE GPU-A readback command list + single fence wait, back-to-back CPU memcpys through RAM,
+// ONE GPU-B upload command list + single fence wait (2 round-trips total regardless of count).
+// On success sets each non-null res->resource to its B-side mirror and returns true. The caller
+// must restore the original pointers after ffxDispatch returns (FFX only records — it does not
+// consume). inputs may contain nulls (optional inputs) which are skipped; max 8 entries.
+bool xgpuBounceInputs(XGpuHub* hub, FfxApiResource** inputs, int nIn);
 
 // Record the output copy-back into the game's command list:
 //   barrier(uploadA GR->CS), barrier(gameTex <declared>->COPY_DEST),

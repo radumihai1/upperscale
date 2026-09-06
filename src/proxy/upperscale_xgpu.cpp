@@ -8,7 +8,9 @@
 //
 // FFX dispatch semantics: ffxDispatch RECORDS compute into the provided command list; it does
 // not execute. xgpuInterceptDispatch therefore:
-//   1. bounces each input A->B synchronously (our own queues + fences on both devices),
+//   1. bounces all inputs A->B in one batched pass (task 6b): ONE GPU-A readback + single fence
+//      wait, back-to-back CPU memcpys through RAM, ONE GPU-B upload + single fence wait —
+//      2 fence round-trips total regardless of input count,
 //   2. hands FFX our GPU-B command list, calls real ffxDispatch (records only),
 //   3. appends an output readback to the same open list, closes+executes it on GPU B, waits,
 //   4. memcpys the result into a rotating A-side UPLOAD ring slot,
@@ -313,127 +315,152 @@ static XGpuMirror* GetOrCreateMirror(XGpuHub* h, ID3D12Resource* srcA) {
 }
 
 // ---------------------------------------------------------------------------
-// A -> B input bounce (synchronous)
+// A -> B input bounce, BATCHED across all inputs of one dispatch.
+//
+// Task 6b: instead of serializing each input through its own pair of fence waits
+// (A-readback wait + B-upload wait per input = 2N round-trips), we submit ALL
+// inputs' A-side copies in ONE command list and wait ONCE, do all CPU memcpys
+// back-to-back with a single Map/Unmap pair on each staging buffer, then submit
+// ALL B-side uploads in ONE command list and wait ONCE. Total: 2 fence round-trips
+// regardless of input count — the transfers are pipelined through shared GPU
+// submissions rather than stalling the render thread between every resource.
 // ---------------------------------------------------------------------------
-bool xgpuBounceInput(XGpuHub* h, FfxApiResource* res) {
-    ID3D12Resource* srcA = (ID3D12Resource*)res->resource;
-    if (!srcA) return true;   // null optional input — nothing to do
+bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
+    XGpuMirror* mFor[8] = {}; uint64_t szFor[8] = {}, offA[8] = {}, offB[8] = {};
+    bool isBufFor[8] = {}; UINT mipsFor[8] = {}; bool active[8] = {};
+    uint64_t total = 0; int nAct = 0;
 
-    XGpuMirror* m = GetOrCreateMirror(h, srcA);
-    if (!m) return false;
-    D3D12_RESOURCE_DESC d = srcA->GetDesc();
-    bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
-
-    // ---- Stage 1: read A into rbA on our queue A ----
-    uint64_t need = 0;
-    UINT mips = 1;
-    if (isBuf) {
-        need = d.Width;
-    } else {
-        mips = d.MipLevels ? d.MipLevels : 1;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-        if (mips > 16) { XLog("ERROR: too many mips %u", mips); return false; }
-        Footprints(h->devA, &d, mips, fp, rows, pitch, slice);
-        for (UINT i = 0; i < mips; ++i) need += slice[i];
-    }
-    GrowBuffer(h, &h->rbA, &h->rbASize, h->devA, D3D12_HEAP_TYPE_READBACK,
-               D3D12_RESOURCE_STATE_COPY_DEST, "A-readback", need);
-    if (!h->rbA) return false;
-
-    // ALL_BARRIERS as StateBefore: robust to whatever tracked state the resource actually has.
-    HRESULT hr = SafeReset(h->clA, h->allocA, &g_resetWarnedA);   // E_FAIL on fresh list is a known quirk — continue
-
-    if (isBuf) {
-        // Game resource: declared state == what the game left it in (we're mid-recording on its CL).
-        Barrier(h->clA, srcA, FfxStateToD3d(res->state), D3D12_RESOURCE_STATE_COPY_SOURCE);
-        h->clA->CopyBufferRegion(h->rbA, 0, srcA, 0, d.Width);
-        Barrier(h->clA, srcA, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(res->state));
-    } else {
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-        Footprints(h->devA, &d, mips, fp, rows, pitch, slice);
-        XLog("bounce in: footprints mips=%u fp0.Offset=%llu fp0.RowPitch=%llu slice0=%llu",
-             mips, (unsigned long long)fp[0].Offset, (unsigned long long)fp[0].Footprint.RowPitch,
-             (unsigned long long)slice[0]);
-        Barrier(h->clA, srcA, FfxStateToD3d(res->state), D3D12_RESOURCE_STATE_COPY_SOURCE);
-        for (UINT i = 0; i < mips; ++i) {
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = h->rbA; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint.Offset = fp[i].Offset;
-            dst.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format); // depth-view mapping
-            dst.PlacedFootprint.Footprint.Width = fp[i].Footprint.Width;
-            dst.PlacedFootprint.Footprint.Height = fp[i].Footprint.Height;
-            dst.PlacedFootprint.Footprint.Depth = 1;
-            dst.PlacedFootprint.Footprint.RowPitch = fp[i].Footprint.RowPitch;
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = srcA; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            src.SubresourceIndex = i;
-            h->clA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    // ---- Phase 0: resolve mirrors + compute per-input sizes/offsets (indexed by original i) ----
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!inputs[i]->resource) continue;
+        ID3D12Resource* srcA = (ID3D12Resource*)inputs[i]->resource;
+        XGpuMirror* m = GetOrCreateMirror(h, srcA);
+        if (!m) return false;
+        D3D12_RESOURCE_DESC d = srcA->GetDesc();
+        bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+        uint64_t sz = 0; UINT mips = 1;
+        if (isBuf) {
+            sz = d.Width;
+        } else {
+            mips = d.MipLevels ? d.MipLevels : 1;
+            if (mips > 16) { XLog("ERROR: too many mips %u", mips); return false; }
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+            Footprints(h->devA, &d, mips, fp, rows, pitch, slice);
+            for (UINT k = 0; k < mips; ++k) sz += slice[k];
         }
-        Barrier(h->clA, srcA, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(res->state));
+        mFor[i] = m; szFor[i] = sz; offA[i] = total; offB[i] = total;
+        isBufFor[i] = isBuf; mipsFor[i] = mips; active[i] = true;
+        total += sz; nAct++;
     }
-    {
-        HRESULT hrC = h->clA->Close();
-        if (FAILED(hrC)) { XLog("ERROR: clA close hr=0x%08X", (unsigned)hrC); return false; }
+    if (nAct == 0) return true;   // all inputs null — nothing to bounce
+
+    // ---- Phase 1: ONE A-readback list for every input, single fence wait ----
+    GrowBuffer(h, &h->rbA, &h->rbASize, h->devA, D3D12_HEAP_TYPE_READBACK,
+               D3D12_RESOURCE_STATE_COPY_DEST, "A-readback", total);
+    if (!h->rbA) return false;
+    SafeReset(h->clA, h->allocA, &g_resetWarnedA);   // E_FAIL on fresh list is a known quirk — continue
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!active[i]) continue;
+        ID3D12Resource* srcA = (ID3D12Resource*)inputs[i]->resource;
+        D3D12_RESOURCE_DESC d = srcA->GetDesc();
+        uint64_t base = offA[i];
+        if (isBufFor[i]) {
+            // Game resource: declared state == what the game left it in (we're mid-recording on its CL).
+            Barrier(h->clA, srcA, FfxStateToD3d(inputs[i]->state), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            h->clA->CopyBufferRegion(h->rbA, base, srcA, 0, d.Width);
+            Barrier(h->clA, srcA, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(inputs[i]->state));
+        } else {
+            UINT mips = mipsFor[i];
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+            Footprints(h->devA, &d, mips, fp, rows, pitch, slice);
+            Barrier(h->clA, srcA, FfxStateToD3d(inputs[i]->state), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            for (UINT k = 0; k < mips; ++k) {
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = h->rbA; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint.Offset = base + fp[k].Offset;
+                dst.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format); // depth-view mapping
+                dst.PlacedFootprint.Footprint.Width = fp[k].Footprint.Width;
+                dst.PlacedFootprint.Footprint.Height = fp[k].Footprint.Height;
+                dst.PlacedFootprint.Footprint.Depth = 1;
+                dst.PlacedFootprint.Footprint.RowPitch = fp[k].Footprint.RowPitch;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = srcA; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                src.SubresourceIndex = k;
+                h->clA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            Barrier(h->clA, srcA, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(inputs[i]->state));
+        }
     }
+    if (FAILED(h->clA->Close())) { XLog("ERROR: clA close (batch)"); return false; }
     ID3D12CommandList* lists[] = { h->clA };
     h->qA->ExecuteCommandLists(1, lists);
     h->fenceValA++;
     h->qA->Signal(h->fenceA, h->fenceValA);
     if (FAILED(h->fenceA->SetEventOnCompletion(h->fenceValA, h->evA))) { XLog("ERROR: fence A event"); return false; }
-    if (WaitForSingleObject(h->evA, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-A readback"); return false; }
+    if (WaitForSingleObject(h->evA, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-A batch readback"); return false; }
 
-    // ---- Stage 2: CPU hop into B upload buffer ----
-    D3D12_RANGE r{0, (SIZE_T)need};
-    void* mRb = nullptr;
-    if (FAILED(h->rbA->Map(0, &r, &mRb))) { XLog("ERROR: rbA map"); return false; }
-
+    // ---- Phase 2: CPU hop — all inputs rbA -> upB back-to-back (the RAM bounce), one Map/Unmap pair each ----
     GrowBuffer(h, &h->upB, &h->upBSize, h->devB, D3D12_HEAP_TYPE_UPLOAD,
-               D3D12_RESOURCE_STATE_GENERIC_READ, "B-upload", need);
-    if (!h->upB) { h->rbA->Unmap(0, nullptr); return false; }
+               D3D12_RESOURCE_STATE_GENERIC_READ, "B-upload", total);
+    if (!h->upB) return false;
     void* mUp = nullptr;
-    if (FAILED(h->upB->Map(0, nullptr, &mUp))) { XLog("ERROR: upB map"); h->rbA->Unmap(0, nullptr); return false; }
-    memcpy(mUp, mRb, need);
-    h->upB->Unmap(0, nullptr);
-    h->rbA->Unmap(0, nullptr);
-
-    // ---- Stage 3: upload into B mirror on our queue B (mirror must be COPY_DEST for the copy) ----
-    hr = SafeReset(h->clB, h->allocB, &g_resetWarnedB);   // E_FAIL on fresh list is a known quirk — continue
-    if (isBuf) {
-        Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        h->clB->CopyBufferRegion(m->resB, 0, h->upB, 0, d.Width);
-        Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    } else {
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-        Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
-        Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        // Our own mirror: use the tracked state (this driver rejects ALL_BARRIERS in transitions).
-        Barrier(h->clB, m->resB, m->lastState, D3D12_RESOURCE_STATE_COPY_DEST);
-        for (UINT i = 0; i < mips; ++i) {
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = h->upB; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Offset = fp[i].Offset;
-            src.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format);
-            src.PlacedFootprint.Footprint.Width = fp[i].Footprint.Width;
-            src.PlacedFootprint.Footprint.Height = fp[i].Footprint.Height;
-            src.PlacedFootprint.Footprint.Depth = 1;
-            src.PlacedFootprint.Footprint.RowPitch = fp[i].Footprint.RowPitch;
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = m->resB; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = i;
-            h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        }
-        Barrier(h->clB, m->resB, D3D12_RESOURCE_STATE_COPY_DEST, FfxStateToD3d(res->state));
-        Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (FAILED(h->upB->Map(0, nullptr, &mUp))) { XLog("ERROR: upB map"); return false; }
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!active[i]) continue;
+        D3D12_RANGE r{offA[i], offA[i] + (SIZE_T)szFor[i]};
+        void* mRb = nullptr;
+        if (FAILED(h->rbA->Map(0, &r, &mRb))) { XLog("ERROR: rbA map"); h->upB->Unmap(0, nullptr); return false; }
+        memcpy((char*)mUp + offB[i], mRb, szFor[i]);
+        h->rbA->Unmap(0, nullptr);
     }
-    if (FAILED(h->clB->Close())) { XLog("ERROR: clB close"); return false; }
+    h->upB->Unmap(0, nullptr);
+
+    // ---- Phase 3: ONE B-upload list for every input, single fence wait ----
+    SafeReset(h->clB, h->allocB, &g_resetWarnedB);   // E_FAIL on fresh list is a known quirk — continue
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!active[i]) continue;
+        XGpuMirror* m = mFor[i];
+        D3D12_RESOURCE_DESC d = ((ID3D12Resource*)inputs[i]->resource)->GetDesc();
+        uint64_t base = offB[i];
+        if (isBufFor[i]) {
+            Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            h->clB->CopyBufferRegion(m->resB, 0, h->upB, base, d.Width);
+            Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        } else {
+            UINT mips = mipsFor[i];
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+            Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+            Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            // Our own mirror: use the tracked state (this driver rejects ALL_BARRIERS in transitions).
+            Barrier(h->clB, m->resB, m->lastState, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (UINT k = 0; k < mips; ++k) {
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = h->upB; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = base + fp[k].Offset;
+                src.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format);
+                src.PlacedFootprint.Footprint.Width = fp[k].Footprint.Width;
+                src.PlacedFootprint.Footprint.Height = fp[k].Footprint.Height;
+                src.PlacedFootprint.Footprint.Depth = 1;
+                src.PlacedFootprint.Footprint.RowPitch = fp[k].Footprint.RowPitch;
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = m->resB; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = k;
+                h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            Barrier(h->clB, m->resB, D3D12_RESOURCE_STATE_COPY_DEST, FfxStateToD3d(inputs[i]->state));
+            Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        }
+    }
+    if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (batch)"); return false; }
     ID3D12CommandList* listsB[] = { h->clB };
     h->qB->ExecuteCommandLists(1, listsB);
     h->fenceValB++;
     h->qB->Signal(h->fenceB, h->fenceValB);
     if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) { XLog("ERROR: fence B event"); return false; }
-    if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-B upload"); return false; }
+    if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-B batch upload"); return false; }
 
-    res->resource = m->resB;   // swap in the B-side mirror for FFX (state field stays as declared)
+    // ---- swap every non-null input to its B-side mirror (state field stays as declared) ----
+    for (int i = 0; i < nIn && i < 8; ++i) if (active[i]) inputs[i]->resource = mFor[i]->resB;
     return true;
 }
 
@@ -548,17 +575,18 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
 
     double t0 = NowMs();
 
-    // ---- bounce every non-null input A -> B (synchronous) ----
+    // ---- bounce every non-null input A -> B (batched — task 6b) ----
     for (int i = 0; i < nIn; ++i) {
         if (!inputs[i]->resource) continue;
         origByField[i] = *inputs[i];
+        wasSwapped[i] = true;   // restore is a no-op if the bounce fails before swapping anything
         XLog("bounce in[%d]: %s %ux%u fmt=0x%x state=0x%x", i,
              inputs[i]->description.type == FFX_API_RESOURCE_TYPE_BUFFER ? "buf" : "tex",
              inputs[i]->description.width, inputs[i]->description.height,
              (unsigned)inputs[i]->description.format, (unsigned)inputs[i]->state);
-        if (!xgpuBounceInput(h, inputs[i])) { XLog("ERROR: input bounce %d failed — aborting dispatch", i); goto restore; }
-        wasSwapped[i] = true;
     }
+    if (nIn > 8) { XLog("ERROR: too many inputs (%d), max 8 — aborting dispatch", nIn); goto restore; }
+    if (!xgpuBounceInputs(h, inputs, nIn)) { XLog("ERROR: batched input bounce failed — aborting dispatch"); goto restore; }
 
     // ---- outputs: point FFX at B-side mirrors of the game's output textures (up to 4 for FG) ----
     for (int i = 0; i < nOut; ++i) {
