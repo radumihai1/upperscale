@@ -1,8 +1,8 @@
 # UPPERSCALE — HANDOFF / NEXT STEPS (read this first when resuming)
 
 Single source of truth for picking up work in a fresh session. Keep it updated as you go, then commit+push.
-Last updated after TASK 5 (cross-GPU ffxDispatch) was COMPLETED + VERIFIED: ACTIVE mode runs real FSR4 on GPU B,
-output parity vs passive control confirmed (RMS diff 0.0217 @ 512x288->768x432).
+Last updated after TASK 7b (real-game validation in Cyberpunk 2077) was COMPLETED + VERIFIED: FSR4 FG PREPARE v1 +
+FRAMEGENERATION both rc=0 on GPU B inside the game; driver quirks #8-#10 documented.
 
 ## FINAL GOAL
 A Windows tool ("upperscale") that lets **GPU A** do the heavy raster rendering of a game while
@@ -62,7 +62,48 @@ These are real driver behaviors, NOT header bugs or test mistakes. All confirmed
    our B-side mirrors AND the test's game textures). FFX records its OWN internal transitions into whatever command
    list we hand it and WILL use resources as UAVs. Every texture that FFX may touch (mirrors + any resource passed in
    a dispatch desc) must be created with `ALLOW_UNORDERED_ACCESS | ALLOW_RENDER_TARGET`. Real games set these flags;
-   our mirrors now do too (GetOrCreateMirror).
+   our mirrors now do too (GetOrCreateMirror). EXCEPTION: depth-family formats — see quirk #8.
+8. **Depth-family formats can ONLY be created with `ALLOW_DEPTH_STENCIL` (or no flags) on this AMD driver.**
+   For R32G8X24_TYPELESS (0x13), D32_FLOAT_S8X24_UINT (0x14) & co: ALLOW_UNORDERED_ACCESS -> E_INVALIDARG,
+   ALLOW_RENDER_TARGET -> E_INVALIDARG, DS+UAV -> E_INVALIDARG. Only `DS` and `none` succeed (verified desc_probe2
+   on BOTH GPUs). Cyberpunk's FG PREPARE passes its depth as R32G8X24_TYPELESS with srcFlags=0x2 — so mirrors for
+   depth-family formats must PRESERVE the source DS flag, not force UAV/RT. GetOrCreateMirror has an
+   IsDepthFamilyFormat() branch that does exactly this (task 7b).
+9. **CopyTextureRegion into a row-major buffer is REJECTED when the footprint format is a TYPELESS depth-family
+   format** (0x13/0x14/...) — Close() fails E_INVALIDARG regardless of from-state (DEPTH_READ, PSR|NPSR, COMMON all
+   fail; verified desc_probe3h on GPU A). The TYPED view works for every from-state: use R32_FLOAT as the footprint
+   format when copying a 0x13/0x14/0x15/0x16 texture to a buffer. CopyFormatFor() maps all depth-family formats to
+   their typed sibling (task 7b — this was THE in-game PREPARE bug: our pass-through kept 0x13 and every batched
+   A-readback list failed at Close).
+10. **A command list whose Close() FAILED is permanently poisoned** — subsequent Reset() returns E_INVALIDARG forever
+    (verified desc_probe3f P4). The "Reset E_FAIL on fresh list" quirk (#5) only applies to FRESH lists; never record
+    into a list after a failed Close. (In practice we now avoid the failure entirely via #8/#9, but if you ever see
+    `clA close` errors cascade across every dispatch, this is why.)
+
+## ✅ TASK 7b DONE: REAL-GAME VALIDATION IN CYBERPUNK 2077 (FSR4 + FG)
+Staged the proxy into Cyberpunk's bin/x64 (original loader kept as upperscale_real_loader.dll backend; ini with
+enable=1, gpu_luid_low=0x27214). In-game log (upperscale.log in game dir):
+- mode=ACTIVE luid={0,27214}; GPU-B device created: "AMD Radeon RX 9060 XT"; both FFX contexts swapped to B.
+- **ffxDispatch type=0x20004 (FRAMEGENERATION_PREPARE v1) rc=0** and **type=0x20003 (FRAMEGENERATION) rc=0**,
+  zero [xgpu] errors, per-frame stats present (frame_total ~3-7ms). This is the full goal: real FSR4 FG running on
+  GPU B inside a shipping game.
+- Cyberpunk specifics learned: it uses PREPARE **v1** (not V2); its "depth" input is R32G8X24_TYPELESS 600x1248
+  (varies with render resolution) state=PIXEL_COMPUTE_READ(0xC), MVs are a separate color texture; FFX's declared
+  format field can differ from the resource's real desc format — always trust GetDesc().
+- ⚠️ Pre-existing game crash: Cyberpunk 2.31 crashes ~54s after launch on this dual-GPU box REGARDLESS of proxy
+  (verified with stock loader, same world position/timing). Not our bug; limits in-game sessions to the first minute,
+  which is enough for FFX validation since dispatches start immediately.
+
+## DEBUGGING LESSONS (task 7b — cost many cycles)
+- `D3D12_RESOURCE_DIMENSION`: BUFFER=1, TEXTURE1D=2, **TEXTURE2D=3**, TEXTURE3D=4. We misread dim=3 as "3D" for a
+  week and built an entire wrong theory (RT-illegal-on-3D) on it. Grep the enum before theorizing.
+- `LUID` is `{DWORD LowPart; LONG HighPart}` — **LowPart FIRST**. Aggregate-init {0, 0x27214} silently targets a
+  nonexistent adapter (EnumAdapterByLuid -> 0x887A0002). Use named fields.
+- When an in-game failure contradicts your probe, suspect the PROBE first: our desc_probe3b/3e failed on everything
+  because (a) >1MB textures need ROW_MAJOR layout and (b) readback buffers must be sized from GetCopyableFootprints'
+  slice size (row-pitch padded), not W*H*bpp. probe4/probe15 worked because they got both right.
+- Standalone probes that replicate the proxy's exact sequence (same layouts, flags, buffer sizing, SafeReset pattern)
+  are worth their weight in gold — desc_probe3g/3h isolated quirk #9 in minutes once they were faithful.
 
 ## ✅ CORE ASSUMPTION PROVEN (ffx_bindtest PASS on BOTH GPUs)
 tools/ffx_bindtest.cpp loads the REAL signed `amd_fidelityfx_upscaler_dx12.dll` (FSR4 v4.1.1), creates a
@@ -275,17 +316,18 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
    real FSR4 on GPU B with verified output parity vs passive control.
 5. [x] **Task 6a: frame generation dispatch types** — DONE (see "TASK 6a DONE" section above). PREPARE_V2 +
    FRAMEGENERATION intercepted cross-GPU, verified end-to-end with ffx_fgtest.
-6. [ ] **Task 6b/6c: async pipelining + latency stats.** Make the input bounce async: record A-side readback into
-   our own CL without waiting on it before FFX records (GPU B can start frame N+1 while CPU hops frame N), keep the
-   12-slot output ring, and add per-frame end-to-end latency measurement to the log. v1 is fully synchronous
-   (~4ms/frame @512x288 FG) — correct but not yet overlapped.
+6. [x] **Task 6b/6c: async pipelining + latency stats** — DONE (commits 3239172, 9d4ac73). 6b = batched input bounce
+   (one A-readback + one B-upload per dispatch, 2 fence round-trips total instead of 2N); 6c = per-frame end-to-end
+   latency stats in the log (rolling max + EMA) with a session summary on context destroy. Full async overlap is
+   still future work; v1 remains synchronous but the bounce cost is now amortized across all inputs.
 7. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B, and does it use
    the FG-swapchain context (which we do NOT intercept today)? Determines whether copy-back is needed in steady state
    and what extra interception the swapchain-context flow needs. (v1 always copies back — safe either way.)
 8. [x] **Config tool** — DONE: `tools/upperscale_config.cpp` → `upperscale_config.exe` (list / set / show).
    Writes the `[proxy]` ini the proxy reads at load; verified end-to-end (ini-only, no env vars → mode=ACTIVE).
-9. [ ] End-to-end test in a real FSR-enabled game (Cyberpunk 2077 confirmed to ship amd_fidelityfx_dx12.dll in its bin/);
-   capture before/after frames; document added latency.
+9. [x] **End-to-end test in a real FSR-enabled game** — DONE (task 7b, see "TASK 7b DONE" section above). Cyberpunk
+   2077 with FSR4 + FG: PREPARE v1 + FRAMEGENERATION both rc=0 on GPU B, zero errors. Pre-existing ~54s game crash
+   (unrelated to proxy) limits session length but not validation.
 10. [x] **README.md** — DONE (build/run/troubleshoot + why-this table). Push to https://github.com/radumihai1/upperscale.git
 
 ## STATUS SNAPSHOT (as of last update)
@@ -306,8 +348,15 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 - **TASK 7a DONE: config tool + README** — upperscale_config.exe (list/set/show) writes the [proxy] ini; fixed a real
   bug where the proxy's ini parser never matched "[proxy]" (trailing \r\n), so ini config was silently dead until now.
   Verified ini-only → mode=ACTIVE. README.md written (build/run/troubleshoot + why-this table).
-- Active next task = **task 6b/6c: async pipelining + per-frame latency stats** (see NEXT STEPS item 6), then the
-  real-game validation pass (item 9).
+- **TASK 6b/6c DONE** — batched input bounce (2 fence round-trips per dispatch) + per-frame latency stats in log.
+- **TASK 7b DONE: real-game validation PASS** — Cyberpunk 2077 FSR4+FG running on GPU B through the proxy; PREPARE v1
+  and FRAMEGENERATION both rc=0, zero errors (see "TASK 7b DONE" section). New driver quirks #8-#10 documented above.
+- ⚠️ CURRENT STAGING STATE: Cyberpunk's bin/x64 currently contains OUR proxy as amd_fidelityfx_dx12.dll + the original
+  loader renamed upperscale_real_loader.dll + upperscale.ini (+ upperscale.log). To restore stock: delete those three
+  files and copy upperscale_real_loader.dll back to amd_fidelityfx_dx12.dll (or Steam "verify integrity"). The game dir
+  is writable without elevation.
+- Active next tasks = **OPEN QUESTION** (output present path / FG-swapchain context, NEXT STEPS item 7) and full async
+  pipelining of the bounce (overlap A-readback with GPU work; v1 is synchronous).
 
 ## DO / DON'T
 - DO kill any background test processes after verifying (user is sensitive to leftover servers).

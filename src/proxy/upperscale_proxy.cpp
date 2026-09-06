@@ -68,6 +68,8 @@ struct Config {
 };
 
 static Config          g_cfg{};
+// Exposed to upperscale_xgpu.cpp so its [xgpu] diagnostics honor the ini/env log level in-game.
+int g_cfgLogLevel = 0;
 static CRITICAL_SECTION g_cs;
 static int             g_csInit = 0;
 static HINSTANCE       g_hInst = nullptr;
@@ -172,6 +174,9 @@ static void LoadConfig() {
     // log file in CWD (games set CWD to their install dir)
     GetCurrentDirectoryA(sizeof(g_logPath), g_logPath);
     strncat_s(g_logPath, "\\upperscale.log", _TRUNCATE);
+
+    // publish the final level so upperscale_xgpu.cpp's [xgpu] diagnostics honor it in-game.
+    g_cfgLogLevel = g_cfg.logLevel;
 }
 
 // ---- Real loader loading (lazy — never in DllMain) ----
@@ -292,7 +297,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         LoadConfig();
         if (g_cfg.logLevel > 0) {
             g_log = fopen(g_logPath, "a");
-            LogAlways("=== upperscale proxy loaded === mode=%s luid={%lx,%lx} log=%d",
+            LogAlways("=== upperscale proxy loaded v8 === mode=%s luid={%lx,%lx} log=%d",
                       g_cfg.enable ? "ACTIVE" : "PASSTHROUGH", g_cfg.luidHi, g_cfg.luidLo, g_cfg.logLevel);
         }
     } else if (reason == DLL_PROCESS_DETACH) {

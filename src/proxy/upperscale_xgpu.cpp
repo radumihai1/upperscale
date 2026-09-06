@@ -75,14 +75,20 @@ struct XGpuHub {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-static int g_xgpuLogOn = -1; // -1 undetermined, 0 off, 1 on (UPPERSCALE_LOG >= 2)
+// The proxy's parsed log level (set by LoadConfig in DllMain before any dispatch). XLog uses it
+// so in-game logging works from the ini even when no UPPERSCALE_LOG env var is set.
+extern int g_cfgLogLevel;
+
 static void XLog(const char* fmt, ...) {
-    if (g_xgpuLogOn == -1) {
+    // Log if either the proxy config (ini/env) or a direct env override says verbose.
+    static int envOverride = -1;   // -1 undetermined
+    if (envOverride == -1) {
         char b[8] = {};
         GetEnvironmentVariableA("UPPERSCALE_LOG", b, sizeof(b));
-        g_xgpuLogOn = atoi(b) >= 2 ? 1 : 0;
+        envOverride = atoi(b);     // 0 if unset
     }
-    if (!g_xgpuLogOn) return;
+    int level = (g_cfgLogLevel > envOverride) ? g_cfgLogLevel : envOverride;
+    if (level < 2) return;
     FILE* f = fopen("upperscale.log", "a");
     if (!f) return;
     fprintf(f, "[xgpu] ");
@@ -112,31 +118,75 @@ static void Barrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r,
 // (verified tools/xgpu_probe18_barrier_uav_common.cpp case g: Close=0). For "unknown current state" use:
 //   Barrier(cl, r, D3D12_RESOURCE_STATE_COMMON, target);
 
-// FFX resource state -> D3D12 tracked state (values from ffx_api_types.h enum)
+// FFX resource state -> D3D12 tracked state (values from ffx_api_types.h enum).
+// Used for the RESTORE barrier after a bounce — must put the game's resource back in the state it
+// declared, so map every FFX state bit accurately. Unknown/0 falls back to COMMON (safe on this
+// driver: transitions out of COMMON are always legal and accepted without validation).
 static D3D12_RESOURCE_STATES FfxStateToD3d(uint32_t s) {
     switch (s) {
-        case 0x1:  return D3D12_RESOURCE_STATE_COMMON;                    // COMMON
-        case 0x2:  return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;          // UAV
-        case 0x4:  return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; // COMPUTE_READ
-        case 0x8:  return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;     // PIXEL_READ
-        case 0xC:  return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); // PIXEL_COMPUTE_READ
-        case 0x10: return D3D12_RESOURCE_STATE_COPY_SOURCE;               // COPY_SRC
-        case 0x20: return D3D12_RESOURCE_STATE_COPY_DEST;                 // COPY_DEST
-        case 0x14: return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+        case 0x1:   return D3D12_RESOURCE_STATE_COMMON;                    // COMMON
+        case 0x2:   return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;          // UAV
+        case 0x4:   return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; // COMPUTE_READ
+        case 0x8:   return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;     // PIXEL_READ
+        case 0xC:   return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); // PIXEL_COMPUTE_READ
+        case 0x10:  return D3D12_RESOURCE_STATE_COPY_SOURCE;               // COPY_SRC
+        case 0x20:  return D3D12_RESOURCE_STATE_COPY_DEST;                 // COPY_DEST
+        case 0x14:  return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                                   D3D12_RESOURCE_STATE_COPY_SOURCE);           // GENERIC_READ
-        default:   return D3D12_RESOURCE_STATE_GENERIC_READ;              // safe for 0/unknown
+        case 0x80:  return D3D12_RESOURCE_STATE_RENDER_TARGET;             // PRESENT (backbuffer pre-Present)
+        case 0x100: return D3D12_RESOURCE_STATE_RENDER_TARGET;             // RENDER_TARGET
+        case 0x200: return D3D12_RESOURCE_STATE_DEPTH_WRITE;               // DEPTH_ATTACHMENT
+        default:    return D3D12_RESOURCE_STATE_COMMON;                    // safe for 0/unknown (incl. INDIRECT_ARGUMENT)
     }
 }
 
+// NOTE on the bounce read barrier: we transition the game resource from FfxStateToD3d(res->state) —
+// i.e. the state the GAME declared in the FFX desc — to COPY_SOURCE, and back afterwards. We trust
+// that declaration (FFX's contract requires it to be accurate) rather than forcing COMMON, because
+// D3D12 uses your declared transitions to insert hardware barriers: claiming "from COMMON" for a
+// resource actually in DEPTH_WRITE would skip the real fence and risk tearing on other drivers.
+
 // Depth/stencil textures must be copied to buffers using their shader-readable view format.
+// CRITICAL (task 7b, desc_probe3h): this AMD driver REJECTS CopyTextureRegion into a row-major
+// buffer when the footprint format is a TYPELESS depth-family format (0x13/0x14/...) — Close()
+// fails with E_INVALIDARG. The typed view (R32_FLOAT) works for every from-state. Cyberpunk's FG
+// PREPARE passes its depth as R32G8X24_TYPELESS, so the pass-through below was the in-game bug.
 static DXGI_FORMAT CopyFormatFor(DXGI_FORMAT f) {
-    switch (f) {
+    switch ((UINT)f) {
+        case 0x13: // R32G8X24_TYPELESS
+            return DXGI_FORMAT_R32_FLOAT;
+        case 0x14: // D32_FLOAT_S8X24_UINT (stencil part is not readable via row-major copy anyway)
+            return DXGI_FORMAT_R32_FLOAT;
+        case 0x15: // R32_FLOAT_X8X24_TYPELESS
+            return DXGI_FORMAT_R32_FLOAT;
+        case 0x16: // X32_TYPELESS_G8X24_UINT (depth part)
+            return DXGI_FORMAT_R32_FLOAT;
         case DXGI_FORMAT_D32_FLOAT:               return DXGI_FORMAT_R32_FLOAT;
-        case DXGI_FORMAT_R32G8X24_TYPELESS:       return DXGI_FORMAT_R32G8X24_TYPELESS;
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:    return DXGI_FORMAT_R32G8X24_TYPELESS; // no _UINT variant in this SDK
         case DXGI_FORMAT_D16_UNORM:               return DXGI_FORMAT_R16_UNORM;
         default:                                  return f;
+    }
+}
+
+// Depth-family formats (typeless or typed depth/stencil). On this AMD driver these can ONLY be
+// created with ALLOW_DEPTH_STENCIL (or no flags) — ALLOW_UNORDERED_ACCESS and ALLOW_RENDER_TARGET
+// are both rejected with E_INVALIDARG (verified in-game + desc_probe2, task 7b: Cyberpunk's FG
+// PREPARE passes a 600x1248 R32G8X24_TYPELESS depth texture; UAV/RT mirrors failed, DS-only worked).
+static bool IsDepthFamilyFormat(DXGI_FORMAT f) {
+    switch ((UINT)f) {
+        case 0x13: // R32G8X24_TYPELESS
+        case 0x14: // D32_FLOAT_S8X24_UINT
+        case 0x15: // R32_FLOAT_X8X24_TYPELESS
+        case 0x16: // X32_TYPELESS_G8X24_UINT
+        case 0x28: // D32_FLOAT (40)
+        case 0x2C: // R24G8_TYPELESS (44)
+        case 0x2D: // D24_UNORM_S8_UINT (45)
+        case 0x2E: // R24_UNORM_X8_TYPELESS (46)
+        case 0x2F: // X24_TYPELESS_G8_UINT (47)
+        case 0x37: // D16_UNORM (55)
+            return true;
+        default:   return false;
     }
 }
 
@@ -287,26 +337,89 @@ static XGpuMirror* GetOrCreateMirror(XGpuHub* h, ID3D12Resource* srcA) {
     memset(m, 0, sizeof(*m));
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
+    // Full source desc dump (diagnostics, task 7b): every field that could make the mirror
+    // creation fail on GPU B — Quality in particular is NOT validated by us and a non-zero
+    // value with Count=1 is illegal.
+    XLog("mirror attempt: %s dim=%u %ux%ux%u fmt=0x%x mips=%u count=%u quality=%u layout=%u align=%llu srcFlags=0x%X",
+         isBuf ? "buf" : "tex", d.Dimension, (unsigned)d.Width, (unsigned)d.Height, d.DepthOrArraySize,
+         (unsigned)d.Format, d.MipLevels, d.SampleDesc.Count, d.SampleDesc.Quality,
+         (unsigned)d.Layout, (unsigned long long)d.Alignment, (unsigned)d.Flags);
+
     // FFX records its own state transitions into our command list and WILL use these mirrors as
     // UAVs (compute writes). Without ALLOW_UNORDERED_ACCESS the driver rejects any transition
-    // into/out of UAV state at Close with E_INVALIDARG — so set it on every mirror.
-    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // into/out of UAV state at Close with E_INVALIDARG — so set it on every SINGLE-SAMPLE mirror.
+    // Flag constraints we must respect when building the mirror's flag set:
+    //   * MSAA (SampleDesc.Count > 1) CANNOT carry ALLOW_UNORDERED_ACCESS / ALLOW_RENDER_TARGET.
+    //   * ALLOW_RENDER_TARGET and ALLOW_DEPTH_STENCIL are MUTUALLY EXCLUSIVE.
+    //   * ALLOW_DEPTH_STENCIL is only legal on depth/stencil FORMATS. Cyberpunk's FG PREPARE passes a
+    //     motion-vector texture (R16G16_FLOAT) whose desc carries ALLOW_DEPTH_STENCIL; inheriting that
+    //     onto a non-depth float format is invalid and fails CreateCommittedResource with E_INVALIDARG
+    //     on GPU B (seen in-game, task 7b). Our mirrors are compute targets for FFX — never real depth
+    //     attachments (FFX reads depth via SRV/compute) — so drop any inherited ALLOW_DEPTH_STENCIL.
+    //   * ALLOW_RENDER_TARGET is NOT legal on TEXTURE3D resources. Cyberpunk's MV texture is a
+    //     depth-1 TEXTURE3D; adding RT to it failed with E_INVALIDARG (task 7b). Keep the dimension as-is
+    //     (FFX creates Texture3D views over it, exactly as it does on the game's original resource) but
+    //     skip the RT flag for 3D.
+    bool msaa = (d.SampleDesc.Count > 1);
+    bool is3D = (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    if (!msaa) d.SampleDesc.Quality = 0;   // Quality must be 0 when Count==1 — illegal otherwise
+    d.Alignment = 0;   // committed mirrors can't carry the source's custom alignment (E_INVALIDARG); FFX doesn't need it
+    D3D12_RESOURCE_FLAGS origFlags = d.Flags;
 
-    HRESULT hr;
-    if (isBuf) {
-        m->sizeBytes = d.Width;
-        hr = h->devB->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m->resB));
+    // Build candidate flag sets to try, in order of preference. We don't always know which
+    // combo the driver accepts for a given desc (format x dimension x flags interactions are
+    // not fully documented), so we try them sequentially and log the winner.
+    struct { D3D12_RESOURCE_FLAGS f; const char* label; } candidates[4];
+    int nCand = 0;
+
+    if (IsDepthFamilyFormat(d.Format)) {
+        // Depth-family: this AMD driver ONLY accepts ALLOW_DEPTH_STENCIL (or none) — UAV and RT
+        // are both E_INVALIDARG. The game's own resource carries DS, so preserve source flags
+        // verbatim first, then fall back to no flags.
+        candidates[nCand++] = { origFlags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL ?
+                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : (D3D12_RESOURCE_FLAGS)0, "srcDS" };
+        if (!(origFlags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            candidates[nCand++] = { D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, "DS" };
+    } else if (!msaa) {
+        // Preferred: UAV + RT (most permissive for FFX which may use either view type)
+        if (!is3D) {
+            candidates[nCand++] = { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, "UAV+RT" };
+        }
+        // UAV only (always legal on single-sample non-MSAA)
+        candidates[nCand++] = { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, "UAV" };
     } else {
-        m->width = (UINT)d.Width; m->height = (UINT)d.Height; m->format = d.Format;
-        hr = h->devB->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m->resB));
+        // MSAA: no UAV/RT allowed — just inherit what's safe
+        candidates[nCand++] = { (D3D12_RESOURCE_FLAGS)0, "none(MSAA)" };
+    }
+    // Fallback: source flags minus DS (in case the driver needs something specific we didn't add)
+    D3D12_RESOURCE_FLAGS srcNoDS = d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (!msaa && !is3D) srcNoDS |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    candidates[nCand++] = { srcNoDS, "srcNoDS" };
+
+    HRESULT hr = E_FAIL;
+    int usedIdx = -1;
+    for (int ci = 0; ci < nCand; ++ci) {
+        d.Flags = candidates[ci].f;
+        if (isBuf) {
+            m->sizeBytes = d.Width;
+            hr = h->devB->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m->resB));
+        } else {
+            m->width = (UINT)d.Width; m->height = (UINT)d.Height; m->format = d.Format;
+            hr = h->devB->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m->resB));
+        }
+        XLog("mirror combo '%s' flags=0x%X -> hr=0x%08X", candidates[ci].label, (unsigned)d.Flags, (unsigned)hr);
+        if (SUCCEEDED(hr)) { usedIdx = ci; break; }
     }
     if (FAILED(hr)) {
-        XLog("ERROR: mirror create failed hr=0x%08X (%s %ux%u fmt=0x%x)", (unsigned)hr,
-             isBuf ? "buf" : "tex", m->width, m->height, (unsigned)m->format);
+        XLog("ERROR: mirror create failed all %d combos last hr=0x%08X (%s dim=%u %ux%ux%u fmt=0x%x mips=%u count=%u quality=%u layout=%u align=%llu srcFlags=0x%X msaa=%d is3D=%d)",
+             nCand, (unsigned)hr, isBuf ? "buf" : "tex", d.Dimension, m->width, m->height, d.DepthOrArraySize,
+             (unsigned)m->format, d.MipLevels, d.SampleDesc.Count, d.SampleDesc.Quality,
+             (unsigned)d.Layout, (unsigned long long)d.Alignment, (unsigned)origFlags, msaa ? 1 : 0, is3D ? 1 : 0);
         return nullptr;
     }
+    XLog("mirror OK via '%s' flags=0x%X", candidates[usedIdx].label, (unsigned)d.Flags);
     m->lastState = D3D12_RESOURCE_STATE_GENERIC_READ;   // creation state
     h->mirrorCount++;
     XLog("new mirror #%d: %s %ux%u fmt=0x%x size=%llu", h->mirrorCount - 1, isBuf ? "buf" : "tex",
