@@ -128,6 +128,29 @@ Test gotcha found while verifying: the test originally passed its command list t
 after a prior execute (real games reset every frame) -> FFX recorded into an already-executed list -> passive mode
 crashed at ExecuteCommandLists. Fixed in the test; not a proxy bug.
 
+## ✅ TASK 6a DONE: FRAME GENERATION DISPATCH WORKS END-TO-END (ACTIVE mode)
+xgpuInterceptDispatch now handles ALL four dispatch node types: UPSCALE, UPSCALE_GENERATEREACTIVEMASK,
+FRAMEGENERATION_PREPARE_V2 (+ deprecated v1), and FRAMEGENERATION. Restructured for up to 4 outputs per
+dispatch (FG generates up to 4 frames): multi-output readback into one rbB buffer at computed offsets, each
+output hops to its own A-side upload ring slot (ring grew 3 -> 12 slots = 4 outputs x 3 in flight), and the
+copy-backs are recorded per-output into the game's command list.
+
+FG flow a game runs (from fsrapirendermodule.cpp ~1490-1660): ffxConfigure(FG config) every frame, then
+ffxDispatch(PREPARE_V2 {depth, MV}) — dilation passes write FFX-internal resources on B, NO outputs to bounce
+back — then ffxDispatch(FRAMEGENERATION {presentColor -> outputs[0..n]}). In non-swapchain mode the game sets
+FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY and supplies its own output texture (what our test does;
+real games with a swapchain use the FG-swapchain context instead — see OPEN QUESTION).
+
+VERIFIED (tools/ffx_fgtest.exe, 512x288 depth+MV + 768x432 presentColor -> generated frame):
+- FG context created through proxy rc=0, provider "3.1.6" (FG version id differs from upscaler's!).
+- 5 frames: PREPARE_V2 rc=0 + FRAMEGENERATION rc=0 every frame; log shows both types intercepted cross-GPU
+  (type=0x2000c and type=0x20003), depth/MV/presentColor bounced A->B, generated frame captured B->A.
+- Generated output: 331761/331776 px non-zero -> PASS.
+
+⚠️ FG gotcha (cost a debug cycle): ffxQuery(GET_VERSIONS) is EFFECT-SPECIFIC — query with the FRAMEGENERATION
+createDescType to get FG version ids. Passing an UPSCALE version id into an FG create-desc override node returns
+FFX_API_RETURN_NO_PROVIDER (rc=4). Same two-phase pattern, just a different createDescType per effect.
+
 ## SDK 10.0.26100 TYPE DIFFERENCES (this box's um/d3d12.h — grep before assuming)
 - `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` (NOT the modern short name `D3D12_PLACED_FOOTPRINT`).
 - No `DXGI_FORMAT_R32G8X24_UINT` constant.
@@ -156,6 +179,13 @@ DLL replacement (OptiScaler-proven pattern):
 FFX API flow (from vendored SDK headers): game -> `ffxCreateContext` / `ffxDispatch`; resources passed via backend
 callbacks; DX12 backend in `api_ffx_api_dx12.h`. AMD loader DLL is a ~26KB stub that loads the real upscaler/FG DLLs —
 our proxy must match its export table (use tools/dump_exports.cpp to enumerate it).
+
+## WHY THIS BEATS THE ALTERNATIVES (user-confirmed positioning, for README)
+- **OptiScaler**: good at rerouting FFX to another GPU, but it CANNOT transfer motion vectors cross-GPU — so real
+  frame generation is out of reach there. We bounce depth + MVs via RAM, which makes true FG on GPU B possible.
+- **Loosless Scaling**: applies filters over frames (frame-level post-processing), not a real FFX reroute with MVs.
+- Our approach intercepts the actual FFX dispatch calls and moves the real inputs (color/depth/MV) — so both
+  upscaling AND frame generation run natively on GPU B with correct motion data.
 
 ## OPEN QUESTION (resolve early, affects design)
 **Where does the upscaled OUTPUT get presented?** GPU B owns the displays but has no physical monitor in the usual
@@ -191,6 +221,9 @@ design. This determines 1 vs 2 bounces per frame.
 - tools/ffx_dispatchtest.cpp — **END-TO-END DISPATCH TEST.** Simulates a game on GPU A (textures + fill), loads our
   proxy, runs ffxCreateContext+ffxDispatch through it in ACTIVE or passive mode, reads the output back and checks
   non-zero pixels. Run from build/smoke/: `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_dispatchtest.exe A out.bin`.
+- tools/ffx_fgtest.cpp — **END-TO-END FRAME GENERATION TEST (task 6a).** FG context + per-frame configure/PREPARE_V2/
+  FRAMEGENERATION through the proxy; verifies the generated frame is non-zero. Run from build/smoke/:
+  `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_fgtest.exe out_fg.bin [frames]`.
 - tools/xgpu_probe15..19.cpp — driver-quirk isolation probes (Reset E_FAIL on fresh lists, ALL_BARRIERS/UAV rejection,
   COMMON(0) escape hatch, full bounce pattern). Keep as reference for quirks #5-#7.
 - docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh. build/smoke/ = working proxy test dir.
@@ -231,17 +264,19 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 3. [x] Build src/proxy/ DLL skeleton + export table + passthrough/active modes — DONE (smoke PASS both modes).
 4. [x] **WIRE ffxDispatch cross-GPU transfer** — DONE (task 5; see "TASK 5 DONE" section above). ACTIVE mode runs
    real FSR4 on GPU B with verified output parity vs passive control.
-5. [ ] **Task 6: frame generation + pipelining.** Add the FG dispatch types to xgpuInterceptDispatch
-   (ffxDispatchDescFrameGenerationPrep / FrameGeneration — inputs depth+MV, outputs interpolation texture; see
-   ffx_framegeneration.h and fsrapirendermodule.cpp lines ~1490-1650 for the exact field lists). Then make the
-   input bounce async: record A-side readback into the game's CL (or our own) without waiting, so GPU B can start
-   frame N+1 while CPU is still hopping frame N. Keep the 3-slot output ring; add per-frame latency stats to log.
-6. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B? Determines
-   whether the copy-back into the game's CL is even needed in steady state. (v1 always copies back — safe either way.)
-7. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write the ini the proxy reads at load.
-8. [ ] End-to-end test in a real FSR-enabled game (Cyberpunk 2077 confirmed to ship amd_fidelityfx_dx12.dll in its bin/);
+5. [x] **Task 6a: frame generation dispatch types** — DONE (see "TASK 6a DONE" section above). PREPARE_V2 +
+   FRAMEGENERATION intercepted cross-GPU, verified end-to-end with ffx_fgtest.
+6. [ ] **Task 6b/6c: async pipelining + latency stats.** Make the input bounce async: record A-side readback into
+   our own CL without waiting on it before FFX records (GPU B can start frame N+1 while CPU hops frame N), keep the
+   12-slot output ring, and add per-frame end-to-end latency measurement to the log. v1 is fully synchronous
+   (~4ms/frame @512x288 FG) — correct but not yet overlapped.
+7. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B, and does it use
+   the FG-swapchain context (which we do NOT intercept today)? Determines whether copy-back is needed in steady state
+   and what extra interception the swapchain-context flow needs. (v1 always copies back — safe either way.)
+8. [ ] Config tool: pick GPU B by LUID (list adapters like device_probe), CLI args, write the ini the proxy reads at load.
+9. [ ] End-to-end test in a real FSR-enabled game (Cyberpunk 2077 confirmed to ship amd_fidelityfx_dx12.dll in its bin/);
    capture before/after frames; document added latency.
-9. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
+10. [ ] Docs (README build/run/troubleshoot), tests, push to https://github.com/radumihai1/upperscale.git
 
 ## STATUS SNAPSHOT (as of last update)
 - Repo at C:\Users\mrmih\Playground\AI\upperscale, git branch main. Remote origin = github radumihai1/upperscale
@@ -255,7 +290,10 @@ If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-he
 - **TASK 5 DONE: cross-GPU ffxDispatch verified end-to-end** — ACTIVE mode bounces inputs A->B, runs real FSR4 on GPU B,
   copies output back into the game's CL. Output parity vs passive control confirmed (RMS diff 0.0217). ~13ms/frame @512x288
   synchronous v1. New driver quirks #5-#7 + SDK type differences documented above — read them before touching barriers.
-- Active next task = **task 6: FG dispatch types + async pipelining** (see NEXT STEPS item 5).
+- **TASK 6a DONE: FG dispatch types verified end-to-end** — PREPARE_V2 (depth+MV) and FRAMEGENERATION (presentColor ->
+  outputs[0..3]) intercepted cross-GPU; ffx_fgtest PASS (5 frames, generated frame non-zero). Multi-output readback +
+  12-slot output ring in place. FG version query gotcha documented above.
+- Active next task = **task 6b/6c: async pipelining + per-frame latency stats** (see NEXT STEPS item 6).
 
 ## DO / DON'T
 - DO kill any background test processes after verifying (user is sensitive to leftover servers).

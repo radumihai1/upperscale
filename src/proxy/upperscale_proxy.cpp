@@ -351,12 +351,12 @@ ffxReturnCode_t __declspec(dllexport) ffxQuery(ffxContext* context, ffxApiHeader
 
 ffxReturnCode_t __declspec(dllexport) ffxDispatch(ffxContext* context, const ffxApiHeader* desc) {
     if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
-    // ACTIVE mode: route the dispatch through the cross-GPU transfer hub (task 5).
+    // ACTIVE mode: route the dispatch through the cross-GPU transfer hub (task 5 + task 6a).
     // The hub bounces inputs A->B via RAM, records FFX into our GPU-B command list, executes it,
-    // captures the output back to an A-side upload slot and records the copy-back into the game's
-    // original command list. Non-upscale dispatch types (FG prepare/present etc.) are forwarded
-    // untouched — they run on GPU B with B-side resources only when their inputs are also ours,
-    // which is not yet wired; forwarding them would mix devices, so we refuse those for now.
+    // captures the output(s) back to A-side upload slots and records the copy-backs into the game's
+    // original command list. Handles upscale + reactive-mask + FG-prepare + FG-generation node types;
+    // unrecognized dispatch types are refused (ERROR_PARAMETER) — forwarding them would mix GPU-A
+    // resources with the GPU-B-bound context (undefined behavior).
     if (g_cfg.enable && g_swapsDone > 0) {
         if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;   // need g_pRealDispatch for the intercept
         CtxInfo* ci = CtxFind(*context);

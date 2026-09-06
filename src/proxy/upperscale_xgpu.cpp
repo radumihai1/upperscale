@@ -27,11 +27,12 @@
 // __declspec(dllexport), which would collide with our own definitions in the proxy DLL.
 #include "../../third_party/FidelityFX-SDK/Kits/FidelityFX/api/include/ffx_api.h"
 #include "../../third_party/FidelityFX-SDK/Kits/FidelityFX/upscalers/include/ffx_upscale.h"
+#include "../../third_party/FidelityFX-SDK/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
 
 // ---------------------------------------------------------------------------
 // Hub definition (opaque in the header)
 // ---------------------------------------------------------------------------
-#define XGPU_OUT_SLOTS 3   // output ring: game may still be executing N-1's copy-back
+#define XGPU_OUT_SLOTS 12  // output ring: up to 4 outputs/dispatch (FG) x 3 frames in flight
 
 typedef struct XGpuMirror {
     ID3D12Resource* resB;      // B-side mirror (texture or buffer), DEFAULT heap, same desc as A
@@ -481,20 +482,23 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     PfnFfxDispatch rd = (PfnFfxDispatch)realDispatch;
     const ffxApiHeader* desc = (const ffxApiHeader*)descIn;
 
-    // ---- locate the effect dispatch node in the chain ----
+    // ---- locate the effect dispatch node in the chain (upscale OR frame generation) ----
     uint64_t nodeType = 0;
     ffxApiHeader* node = nullptr;
     for (const ffxApiHeader* n = desc; n; n = n->pNext) {
         if (n->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE ||
-            n->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
+            n->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK ||
+            n->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2 ||
+            n->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE ||   // deprecated v1, same field offsets
+            n->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION) {
             nodeType = n->type; node = (ffxApiHeader*)n; break;
         }
     }
-    if (!node) { XLog("intercept: no upscale node in chain (top=0x%llx)", (unsigned long long)desc->type); return FFX_API_RETURN_ERROR_PARAMETER; }
+    if (!node) { XLog("intercept: no upscale/FG node in chain (top=0x%llx)", (unsigned long long)desc->type); return FFX_API_RETURN_ERROR_PARAMETER; }
 
     // ---- collect input/output field pointers for this node type ----
     FfxApiResource* inputs[8] = {}; int nIn = 0;
-    FfxApiResource* outRes = nullptr;
+    FfxApiResource* outputs[4] = {}; int nOut = 0;
     ID3D12GraphicsCommandList** pCmdList = nullptr;
     if (nodeType == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         ffxDispatchDescUpscale* u = (ffxDispatchDescUpscale*)node;
@@ -504,21 +508,35 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
         inputs[nIn++] = &u->exposure;
         inputs[nIn++] = &u->reactive;
         inputs[nIn++] = &u->transparencyAndComposition;
-        outRes = &u->output;
+        outputs[nOut++] = &u->output;
         pCmdList = (ID3D12GraphicsCommandList**)&u->commandList;
-    } else { // GENERATEREACTIVEMASK
+    } else if (nodeType == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
         ffxDispatchDescUpscaleGenerateReactiveMask* u = (ffxDispatchDescUpscaleGenerateReactiveMask*)node;
         inputs[nIn++] = &u->colorOpaqueOnly;
         inputs[nIn++] = &u->colorPreUpscale;
-        outRes = &u->outReactive;
+        outputs[nOut++] = &u->outReactive;
         pCmdList = (ID3D12GraphicsCommandList**)&u->commandList;
+    } else if (nodeType == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2 ||
+               nodeType == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE) {
+        // v1 and V2 share the same offsets for everything we touch (depth/MV/commandList).
+        ffxDispatchDescFrameGenerationPrepareV2* p = (ffxDispatchDescFrameGenerationPrepareV2*)node;
+        inputs[nIn++] = &p->depth;
+        inputs[nIn++] = &p->motionVectors;
+        // no outputs — dilation passes write into FFX-internal resources on B
+        pCmdList = (ID3D12GraphicsCommandList**)&p->commandList;
+    } else { // FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION
+        ffxDispatchDescFrameGeneration* g = (ffxDispatchDescFrameGeneration*)node;
+        inputs[nIn++] = &g->presentColor;
+        uint32_t nGen = g->numGeneratedFrames > 4 ? 4 : g->numGeneratedFrames;
+        for (uint32_t i = 0; i < nGen; ++i) outputs[nOut++] = &g->outputs[i];
+        pCmdList = (ID3D12GraphicsCommandList**)&g->commandList;
     }
 
     // ---- save originals for restore (per field index — robust to partial failure) ----
     FfxApiResource origByField[8]; bool wasSwapped[8] = {};
     ID3D12GraphicsCommandList* origCmdList = *pCmdList;
-    FfxApiResource origOut = *outRes;
-    bool outSwapped = false;
+    FfxApiResource origOuts[4]; bool outSwapped[4] = {};
+    for (int i = 0; i < nOut; ++i) origOuts[i] = *outputs[i];
     ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
 
     double t0 = NowMs();
@@ -535,12 +553,13 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
         wasSwapped[i] = true;
     }
 
-    // ---- output: point FFX at a B-side mirror of the game's output texture ----
-    if (outRes->resource) {
-        XGpuMirror* mOut = GetOrCreateMirror(h, (ID3D12Resource*)outRes->resource);
+    // ---- outputs: point FFX at B-side mirrors of the game's output textures (up to 4 for FG) ----
+    for (int i = 0; i < nOut; ++i) {
+        if (!outputs[i]->resource) continue;
+        XGpuMirror* mOut = GetOrCreateMirror(h, (ID3D12Resource*)outputs[i]->resource);
         if (!mOut) goto restore;
-        outRes->resource = mOut->resB;
-        outSwapped = true;
+        outputs[i]->resource = mOut->resB;
+        outSwapped[i] = true;
     }
 
     // ---- hand FFX our GPU-B command list and record (E_FAIL on fresh list is a known quirk) ----
@@ -552,108 +571,143 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     double t2 = NowMs();
     if (rc != FFX_API_RETURN_OK) { XLog("real ffxDispatch failed rc=%u", rc); goto restore; }
 
-    // ---- append output readback to the SAME open list FFX recorded into, execute on B ----
-    ID3D12Resource* upAUsed = nullptr;
-    if (outSwapped && outRes->resource) {
-        ID3D12Resource* srcB = (ID3D12Resource*)outRes->resource;   // our B-side mirror
-        D3D12_RESOURCE_DESC d = srcB->GetDesc();
-        bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
-
-        uint64_t need = 0;
-        UINT mips = 1;
-        if (isBuf) {
-            need = d.Width;
-        } else {
-            mips = d.MipLevels ? d.MipLevels : 1;
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-            if (mips <= 16) {
-                Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
-                for (UINT i = 0; i < mips; ++i) need += slice[i];
-            } else need = 0;
-        }
-
-        if (need > 0) {
-            GrowBuffer(h, &h->rbB, &h->rbBSize, h->devB, D3D12_HEAP_TYPE_READBACK,
-                       D3D12_RESOURCE_STATE_COPY_DEST, "B-readback", need);
-            if (h->rbB) {
-                bool ok = true;
-                if (isBuf) {
-                    // FFX may have left the mirror in any state after its passes — transition from COMMON(0).
-                    Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    h->clB->CopyBufferRegion(h->rbB, 0, srcB, 0, d.Width);
-                    Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOut.state));
-                } else {
-                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-                    Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
-                    // FFX may have left the mirror in any state after its passes — transition from COMMON(0)
-                    // (this driver rejects ALL_BARRIERS and UAV barriers; verified xgpu_probe18 case g).
-                    Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    for (UINT i = 0; i < mips; ++i) {
-                        D3D12_TEXTURE_COPY_LOCATION dst{};
-                        dst.pResource = h->rbB; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                        dst.PlacedFootprint.Offset = fp[i].Offset;
-                        dst.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format);
-                        dst.PlacedFootprint.Footprint.Width = fp[i].Footprint.Width;
-                        dst.PlacedFootprint.Footprint.Height = fp[i].Footprint.Height;
-                        dst.PlacedFootprint.Footprint.Depth = 1;
-                        dst.PlacedFootprint.Footprint.RowPitch = fp[i].Footprint.RowPitch;
-                        D3D12_TEXTURE_COPY_LOCATION src{};
-                        src.pResource = srcB; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                        src.SubresourceIndex = i;
-                        h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    // ---- append output readbacks to the SAME open list FFX recorded into, execute on B ----
+    ID3D12Resource* upAUsed[4] = {};   // A-side upload slot per swapped output (nullptr if not captured)
+    {
+        uint64_t totalNeed = 0;
+        for (int i = 0; i < nOut; ++i)
+            if (outSwapped[i]) {
+                D3D12_RESOURCE_DESC d = ((ID3D12Resource*)outputs[i]->resource)->GetDesc();
+                if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) totalNeed += d.Width;
+                else {
+                    UINT mips = d.MipLevels ? d.MipLevels : 1;
+                    if (mips <= 16) {
+                        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+                        Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+                        for (UINT k = 0; k < mips; ++k) totalNeed += slice[k];
                     }
-                    Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOut.state));
+                }
+            }
+
+        if (totalNeed > 0) {
+            GrowBuffer(h, &h->rbB, &h->rbBSize, h->devB, D3D12_HEAP_TYPE_READBACK,
+                       D3D12_RESOURCE_STATE_COPY_DEST, "B-readback", totalNeed);
+            if (h->rbB) {
+                uint64_t off = 0;
+                for (int i = 0; i < nOut && h->rbB; ++i) {
+                    if (!outSwapped[i]) continue;
+                    ID3D12Resource* srcB = (ID3D12Resource*)outputs[i]->resource;   // our B-side mirror
+                    D3D12_RESOURCE_DESC d = srcB->GetDesc();
+                    bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+
+                    uint64_t need = 0;
+                    UINT mips = 1;
+                    if (isBuf) {
+                        need = d.Width;
+                    } else {
+                        mips = d.MipLevels ? d.MipLevels : 1;
+                        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+                        if (mips <= 16) {
+                            Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+                            for (UINT k = 0; k < mips; ++k) need += slice[k];
+                        } else continue;   // too many mips — skip this output
+                    }
+
+                    if (isBuf) {
+                        // FFX may have left the mirror in any state after its passes — transition from COMMON(0).
+                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        h->clB->CopyBufferRegion(h->rbB, off, srcB, 0, d.Width);
+                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
+                    } else {
+                        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+                        Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+                        // FFX may have left the mirror in any state after its passes — transition from COMMON(0)
+                        // (this driver rejects ALL_BARRIERS and UAV barriers; verified xgpu_probe18 case g).
+                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        for (UINT k = 0; k < mips; ++k) {
+                            D3D12_TEXTURE_COPY_LOCATION dst{};
+                            dst.pResource = h->rbB; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            dst.PlacedFootprint.Offset = off + fp[k].Offset;
+                            dst.PlacedFootprint.Footprint.Format = CopyFormatFor(d.Format);
+                            dst.PlacedFootprint.Footprint.Width = fp[k].Footprint.Width;
+                            dst.PlacedFootprint.Footprint.Height = fp[k].Footprint.Height;
+                            dst.PlacedFootprint.Footprint.Depth = 1;
+                            dst.PlacedFootprint.Footprint.RowPitch = fp[k].Footprint.RowPitch;
+                            D3D12_TEXTURE_COPY_LOCATION src{};
+                            src.pResource = srcB; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            src.SubresourceIndex = k;
+                            h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        }
+                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
+                    }
+                    off += need;
                 }
 
-                if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (output) failed"); ok = false; }
-                if (ok) {
+                if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (output) failed"); }
+                else {
                     ID3D12CommandList* lists[] = { h->clB };
                     h->qB->ExecuteCommandLists(1, lists);
                     h->fenceValB++;
                     h->qB->Signal(h->fenceB, h->fenceValB);
-                    if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) { XLog("ERROR: fence B event"); ok = false; }
-                    else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-B output readback"); ok = false; }
+                    if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
+                    else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B output readback");
 
-                    if (ok) {
-                        // CPU hop into the next A-side upload ring slot
-                        D3D12_RANGE r{0, (SIZE_T)need};
-                        void* mRb = nullptr;
-                        if (FAILED(h->rbB->Map(0, &r, &mRb))) { XLog("ERROR: rbB map failed"); ok = false; }
+                    // CPU hop: each captured output -> its own A-side upload ring slot
+                    uint64_t off2 = 0;
+                    for (int i = 0; i < nOut && h->rbB; ++i) {
+                        if (!outSwapped[i]) continue;
+                        ID3D12Resource* srcB = (ID3D12Resource*)outputs[i]->resource;
+                        D3D12_RESOURCE_DESC d = srcB->GetDesc();
+                        bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+                        uint64_t need = 0;
+                        UINT mips = 1;
+                        if (isBuf) need = d.Width;
                         else {
-                            int slotIdx = h->outNext % XGPU_OUT_SLOTS;
-                            OutSlot* os = &h->outSlots[slotIdx];
-                            if (!os->upA || os->size < need) {
-                                if (os->upA) { os->upA->Release(); os->upA = nullptr; }
-                                uint64_t sz = need < (1u << 20) ? (1u << 20) : need;
-                                HRESULT hr2 = MakeBuffer(h->devA, D3D12_HEAP_TYPE_UPLOAD, sz,
-                                                         D3D12_RESOURCE_STATE_GENERIC_READ, &os->upA);
-                                if (FAILED(hr2)) { XLog("ERROR: out-slot upload create 0x%08X", (unsigned)hr2); ok = false; }
-                                else os->size = sz;
-                            }
-                            if (ok) {
-                                void* mUpA = nullptr;
-                                if (FAILED(os->upA->Map(0, nullptr, &mUpA))) { XLog("ERROR: out-slot upload map failed"); ok = false; }
-                                else {
-                                    memcpy(mUpA, mRb, need);
-                                    os->upA->Unmap(0, nullptr);
-                                    upAUsed = os->upA;
-                                    h->outNext++;
-                                }
-                            }
-                            if (ok) h->rbB->Unmap(0, nullptr);
+                            mips = d.MipLevels ? d.MipLevels : 1;
+                            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+                            if (mips <= 16) {
+                                Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+                                for (UINT k = 0; k < mips; ++k) need += slice[k];
+                            } else continue;
                         }
+
+                        D3D12_RANGE r{off2, off2 + (SIZE_T)need};
+                        void* mRb = nullptr;
+                        if (FAILED(h->rbB->Map(0, &r, &mRb))) { XLog("ERROR: rbB map failed"); continue; }
+                        int slotIdx = h->outNext % XGPU_OUT_SLOTS;
+                        OutSlot* os = &h->outSlots[slotIdx];
+                        if (!os->upA || os->size < need) {
+                            if (os->upA) { os->upA->Release(); os->upA = nullptr; }
+                            uint64_t sz = need < (1u << 20) ? (1u << 20) : need;
+                            HRESULT hr2 = MakeBuffer(h->devA, D3D12_HEAP_TYPE_UPLOAD, sz,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, &os->upA);
+                            if (FAILED(hr2)) { XLog("ERROR: out-slot upload create 0x%08X", (unsigned)hr2); h->rbB->Unmap(0, nullptr); continue; }
+                            os->size = sz;
+                        }
+                        void* mUpA = nullptr;
+                        if (FAILED(os->upA->Map(0, nullptr, &mUpA))) { XLog("ERROR: out-slot upload map failed"); h->rbB->Unmap(0, nullptr); continue; }
+                        memcpy(mUpA, mRb, need);
+                        os->upA->Unmap(0, nullptr);
+                        upAUsed[i] = os->upA;
+                        h->outNext++;
+                        h->rbB->Unmap(0, nullptr);
+                        off2 += need;
                     }
                 }
             }
         }
     }
 
-    // ---- record the copy-back into the GAME's command list (still open — mid-recording) ----
-    if (upAUsed && origCmdList) {
-        xgpuRecordOutputCopyBack(h, origCmdList, &origOut, upAUsed);
-    } else if (outSwapped) {
-        XLog("WARNING: output capture failed — game's output texture holds stale data this frame");
+    // ---- record the copy-backs into the GAME's command list (still open — mid-recording) ----
+    int anyCopied = 0, anySwapped = 0;
+    for (int i = 0; i < nOut; ++i) {
+        if (!outSwapped[i]) continue;
+        anySwapped++;
+        if (upAUsed[i] && origCmdList) { xgpuRecordOutputCopyBack(h, origCmdList, &origOuts[i], upAUsed[i]); anyCopied++; }
     }
+    if (anySwapped > anyCopied)
+        XLog("WARNING: %d/%d output captures failed — game's output textures hold stale data this frame",
+             anySwapped - anyCopied, anySwapped);
 
     double t3 = NowMs();
     h->dispatches++;
@@ -671,7 +725,7 @@ restore:
     // restore the desc exactly as the game passed it (per field, only what we swapped)
     for (int i = 0; i < nIn; ++i) if (wasSwapped[i]) inputs[i]->resource = origByField[i].resource;
     *pCmdList = origCmdList;
-    *outRes = origOut;
+    for (int i = 0; i < nOut; ++i) if (outSwapped[i]) outputs[i]->resource = origOuts[i].resource;
 
     return rc;
 }
