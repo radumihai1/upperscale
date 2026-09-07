@@ -1,0 +1,35 @@
+// upperscale_version.rc — version resources for the proxy DLL.
+//
+// WHY THIS EXISTS: Cyberpunk (and likely other games) gate FSR4/FG availability on the AMD
+// loader's FILE VERSION, not just its exports/API behavior. The stock Cyberpunk loader reports
+// FileVersion 1.0.1.41314 / ProductName "AMD FidelityFX" — our proxy reported 0.0.0.0 with no
+// product name, so the game hid FSR4 from the upscaler list even in pure passthrough mode
+// (verified: every ffx* call forwarded verbatim, all rc=0, yet FSR4 still disappeared).
+// We therefore mirror the stock loader's version metadata exactly.
+#include <windows.h>
+
+1 VERSIONINFO
+FILEVERSION     1,0,1,41314
+PRODUCTVERSION  1,0,1,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Advanced Micro Devices, Inc."
+            VALUE "FileDescription",  "DX12 AMD FidelityFX Library"
+            VALUE "FileVersion",      "1.0.1.41314"
+            VALUE "InternalName",     ""
+            VALUE "LegalCopyright",   "Copyright (C) 2024"
+            VALUE "OriginalFilename", ""
+            VALUE "ProductName",      "AMD FidelityFX"
+            VALUE "ProductVersion",   "1.0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -24,6 +24,7 @@
 //   UPPERSCALE_LOG=<0|1|2>         0=off, 1=create/destroy only (default), 2+=verbose per-call
 
 #include "upperscale_xgpu.h"   // windows.h + d3d12/dxgi + FFX SDK headers in the right order
+#include "upperscale_overlay.h"  // HUD + live control API (g_upperscaleStats defined below)
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -65,11 +66,17 @@ struct Config {
     ULONG    luidHi, luidLo;
     char     realLoaderPath[512];
     int      logLevel;
+    int      fgOnB;        // 1 = frame generation on GPU B (default), 0 = FG native on A (safe mode)
 };
 
 static Config          g_cfg{};
 // Exposed to upperscale_xgpu.cpp so its [xgpu] diagnostics honor the ini/env log level in-game.
 int g_cfgLogLevel = 0;
+// fg=1 (default): frame generation also runs on GPU B (full cross-GPU). fg=0: FG stays native on
+// the main GPU A and is forwarded untouched — only upscaling goes cross-GPU. This is the SAFE mode:
+// Cyberpunk's FG presentColor input is a swapchain backbuffer in PRESENT state, and mirroring +
+// copy-back'ing it across GPUs crashes deterministically after ~2 frames on this driver (task 7b).
+int g_cfgFgOnB = 1;
 static CRITICAL_SECTION g_cs;
 static int             g_csInit = 0;
 static HINSTANCE       g_hInst = nullptr;
@@ -83,6 +90,76 @@ static ID3D12Device*     g_gpuBDev = nullptr;    // our LUID-selected device (la
 static char              g_logPath[512]{};
 static FILE*             g_log = nullptr;
 static int               g_swapsDone = 0;
+
+// ---- Live stats + control state (read by the HUD thread, written by render/config threads) ----
+UpperscaleStats g_upperscaleStats{};   // zero-initialized at load time
+
+static void LogAlways(const char* fmt, ...);   // fwd — defined below with the other logging helpers
+
+// Persist a single key=value line into upperscale.ini in CWD (create if missing). Used by the
+// live hotkey toggles so a mode/log change survives a game restart. Best-effort: never blocks or
+// fails the render path — on any error we just skip persistence.
+static void IniSetKey(const char* key, const char* value) {
+    char dir[MAX_PATH] = {};
+    if (!GetCurrentDirectoryA(sizeof(dir), dir)) return;
+    char iniPath[MAX_PATH * 2] = {};
+    snprintf(iniPath, sizeof(iniPath), "%s\\upperscale.ini", dir);
+
+    // Read existing lines (keep everything except the key we're replacing). If no ini exists yet,
+    // buf stays empty and we create a fresh [proxy] section below.
+    FILE* f = fopen(iniPath, "r");
+    char buf[8192] = {};
+    size_t n = 0;
+    if (f) {
+        while (n < sizeof(buf) - 64 && fgets(buf + n, sizeof(buf) - n, f)) n += strlen(buf + n);
+        fclose(f);
+    }
+
+    char out[16384] = {};
+    size_t o = 0;
+    int inProxy = (strstr(buf, "[proxy]") != nullptr);
+    if (!inProxy) { snprintf(out + o, sizeof(out) - o, "[proxy]\n"); o += strlen(out + o); }
+
+    char* savep = nullptr;
+    for (char* line = strtok_s(buf, "\r\n", &savep); line; line = strtok_s(nullptr, "\r\n", &savep)) {
+        // skip the old occurrence of our key inside [proxy]
+        if (!strnicmp(line, key, strlen(key)) && line[strlen(key)] == '=') continue;
+        snprintf(out + o, sizeof(out) - o, "%s\n", line);
+        o += strlen(out + o);
+    }
+    // append (or create) the new key=value at the end of [proxy]
+    snprintf(out + o, sizeof(out) - o, "%s=%s\n", key, value);
+
+    FILE* w = fopen(iniPath, "w");
+    if (!w) return;
+    fputs(out, w);
+    fclose(w);
+}
+
+// Live control API — called by the HUD hotkeys (and exportable for external tools).
+int upperscaleSetMode(int enable) {
+    EnterCriticalSection(&g_cs);
+    g_cfg.enable = enable ? 1 : 0;
+    LeaveCriticalSection(&g_cs);
+    InterlockedExchange(&g_upperscaleStats.mode, g_cfg.enable);
+    IniSetKey("enable", g_cfg.enable ? "1" : "0");
+    LogAlways("LIVE: mode -> %s (persisted to upperscale.ini)", g_cfg.enable ? "ACTIVE" : "PASSTHROUGH");
+    return g_cfg.enable;
+}
+
+int upperscaleSetLogLevel(int level) {
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    EnterCriticalSection(&g_cs);
+    g_cfg.logLevel = level;
+    LeaveCriticalSection(&g_cs);
+    g_cfgLogLevel = level;   // upperscale_xgpu.cpp reads this for [xgpu] diagnostics
+    InterlockedExchange((volatile LONG*)&g_upperscaleStats.logLevel, level);
+    char val[2] = { (char)('0' + level), 0 };
+    IniSetKey("log", val);
+    LogAlways("LIVE: log level -> %d (persisted to upperscale.ini)", level);
+    return level;
+}
 
 // context bookkeeping for task 5: ffxContext -> original game device (GPU A) + transfer hub
 struct CtxInfo { ffxContext ctx; ID3D12Device* origDev; XGpuHub* hub; };
@@ -122,6 +199,8 @@ static void LoadConfig() {
     g_cfg.luidHi = 0;
     g_cfg.luidLo = 0;
     g_cfg.logLevel = 1;
+    g_cfg.fgOnB = 1;   // fg=0 (safe fallback): FG stays native on GPU A, only upscaling goes cross-GPU.
+                       // Cyberpunk's FSR4 pipeline is entirely FG-family contexts, so fg=0 ≈ passthrough there.
     g_cfg.realLoaderPath[0] = 0;
 
     char buf[64] = {};
@@ -133,6 +212,8 @@ static void LoadConfig() {
         strncpy_s(g_cfg.realLoaderPath, buf, _TRUNCATE);
     if (GetEnvironmentVariableA("UPPERSCALE_LOG", buf, sizeof(buf)))
         g_cfg.logLevel = atoi(buf);
+    if (GetEnvironmentVariableA("UPPERSCALE_FG", buf, sizeof(buf)))
+        g_cfg.fgOnB = atoi(buf) != 0;
 
     // ini fallback: upperscale.ini in CWD  [proxy] enable=1 gpu_luid_low=0x27214 ...
     FILE* ini = fopen("upperscale.ini", "r");
@@ -156,6 +237,7 @@ static void LoadConfig() {
                 else if (!stricmp(key, "real_loader") && g_cfg.realLoaderPath[0] == 0)
                     strncpy_s(g_cfg.realLoaderPath, val, _TRUNCATE);
                 else if (!stricmp(key, "log")) g_cfg.logLevel = atoi(val);
+                else if (!stricmp(key, "fg")) g_cfg.fgOnB = atoi(val) != 0;
             }
         }
         fclose(ini);
@@ -227,6 +309,7 @@ static ID3D12Device* GetGpuBDevice() {
                     WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nameA, sizeof(nameA), nullptr, nullptr);
                     if (SUCCEEDED(hr)) {
                         g_gpuBDev = dev;
+                        strncpy_s(g_upperscaleStats.gpuBName, nameA, _TRUNCATE);   // HUD display
                         LogAlways("created GPU-B device by LUID {%lx,%lx}: %s", g_cfg.luidHi, g_cfg.luidLo, nameA);
                     } else {
                         LogAlways("ERROR: D3D12CreateDevice on matched adapter failed hr=0x%08lX", (unsigned)hr);
@@ -295,9 +378,16 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         InitializeCriticalSection(&g_cs);
         g_csInit = 1;
         LoadConfig();
+        g_cfgFgOnB = g_cfg.fgOnB;   // published for the dispatch gate in ffxDispatch below
+        // publish config into the live stats block (HUD reads it) and start the debug HUD thread.
+        g_upperscaleStats.mode = g_cfg.enable ? 1 : 0;
+        g_upperscaleStats.logLevel = g_cfg.logLevel;
+        g_upperscaleStats.luidLo = g_cfg.luidLo;
+        g_upperscaleStats.luidHi = g_cfg.luidHi;
+        upperscaleOverlayStart(1);   // always available — Insert hides it (debug tool)
         if (g_cfg.logLevel > 0) {
             g_log = fopen(g_logPath, "a");
-            LogAlways("=== upperscale proxy loaded v8 === mode=%s luid={%lx,%lx} log=%d",
+            LogAlways("=== upperscale proxy loaded v9 === mode=%s luid={%lx,%lx} log=%d",
                       g_cfg.enable ? "ACTIVE" : "PASSTHROUGH", g_cfg.luidHi, g_cfg.luidLo, g_cfg.logLevel);
         }
     } else if (reason == DLL_PROCESS_DETACH) {

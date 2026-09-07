@@ -1,7 +1,15 @@
-third_party/dx-samples/
-third_party/agility-sdk/
-third_party/FidelityFX-SDK/
-third_party/d3d12_headers/
-build/*
-!build/msvc_env.sh
+# build outputs
+build/
 *.obj
+*.res
+*.i
+preproc.err
+
+# vendored SDK (3.4GB — never commit)
+third_party/
+
+# test scratch
+_input.txt
+_t_*.bat
+_test_*.bat
+_repro.bat

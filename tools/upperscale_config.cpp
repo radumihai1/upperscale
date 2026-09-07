@@ -84,7 +84,7 @@ static int CmdList() {
 }
 
 static int ResolveAdapter(const AdapterInfo* a, int n, const char* arg) {
-    // Accept "3" (index) or "0x..." / hex LUID.
+    // Accept "3" (index), "0x..." hex LUID, or a bare decimal that is NOT a valid index.
     if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
         unsigned long long want = strtoull(arg, nullptr, 16);
         for (int i = 0; i < n; ++i) {
@@ -93,13 +93,25 @@ static int ResolveAdapter(const AdapterInfo* a, int n, const char* arg) {
         }
         return -1;
     }
-    long idx = strtol(arg, nullptr, 10);
-    if (idx >= 0 && idx < n) return (int)idx;
-    // maybe it's a bare hex LUID without 0x prefix
+    // Decimal index takes PRIORITY: "1" means adapter [1], never an LUID. (Old bug: the hex
+    // fallback below matched luidLo=0x27214 against input "1" and silently picked adapter 0.)
+    char* end = nullptr;
+    long idx = strtol(arg, &end, 10);
+    if (end && *end == 0) {
+        if (idx >= 0 && idx < n) return (int)idx;
+        // decimal but out of range — try it as a bare LUID before giving up
+        unsigned long long want = (unsigned long long)idx;
+        for (int i = 0; i < n; ++i) {
+            unsigned long long luid = ((unsigned long long)a[i].luidHi << 32) | a[i].luidLo;
+            if (luid == want || (want & 0xFFFFFFFFull) == a[i].luidLo && a[i].luidHi == 0) return i;
+        }
+        return -1;
+    }
+    // Not pure decimal — treat as bare hex LUID.
     unsigned long long want = strtoull(arg, nullptr, 16);
     for (int i = 0; i < n; ++i) {
         unsigned long long luid = ((unsigned long long)a[i].luidHi << 32) | a[i].luidLo;
-        if (luid == want) return i;
+        if (luid == want || (want & 0xFFFFFFFFull) == a[i].luidLo && a[i].luidHi == 0) return i;
     }
     return -1;
 }
@@ -163,7 +175,7 @@ static int CmdShow(const char* dir) {
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2 || !strcmp(argv[1], "list") || !strcmp(argv[1], "-l")) return CmdList();
-    if (!strcmp(argv[1], "set")) return CmdSet(argc - 1, argv + 1);
+    if (!strcmp(argv[1], "set")) return CmdSet(argc - 2, argv + 2);   // skip exe name AND "set"
     if (!strcmp(argv[1], "show")) {
         char dir[MAX_PATH]{}; _getcwd(dir, MAX_PATH);
         for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--dir") && i + 1 < argc) strncpy_s(dir, argv[++i], _TRUNCATE);

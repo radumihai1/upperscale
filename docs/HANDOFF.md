@@ -1,366 +1,203 @@
-# UPPERSCALE — HANDOFF / NEXT STEPS (read this first when resuming)
+# upperscale — HANDOFF (updated 2026-09-07)
 
-Single source of truth for picking up work in a fresh session. Keep it updated as you go, then commit+push.
-Last updated after TASK 7b (real-game validation in Cyberpunk 2077) was COMPLETED + VERIFIED: FSR4 FG PREPARE v1 +
-FRAMEGENERATION both rc=0 on GPU B inside the game; driver quirks #8-#10 documented.
+Cross-GPU FSR4/frame-generation proxy for Cyberpunk 2077 on a dual-AMD box.
+GPU A = RX 7900 XTX (LUID low=0x2A089, high=0) — game rendering.
+GPU B = RX 9060 XT (LUID low=0x27214, high=0) — display output adapter; both monitors cabled here.
 
-## FINAL GOAL
-A Windows tool ("upperscale") that lets **GPU A** do the heavy raster rendering of a game while
-**GPU B** does FSR/FSR4 upscaling + frame generation, by intercepting AMD's FidelityFX DLL calls
-and rerouting all FFX compute to GPU B. The game must have FSR enabled (that is what produces the
-motion vectors / depth / jitter we need); we do NOT disable it — we swap which device runs the math.
+This document is the single source of truth for resuming work. It separates VERIFIED facts from
+HYPOTHESES. Do not treat hypotheses as established.
 
-Deliverable: a drop-in replacement `amd_fidelityfx_dx12.dll` + a small config/CLI tool, open source,
-MIT/Apache-licensed, vendoring AMD's official FidelityFX SDK (permissive) rather than OptiScaler GPL code.
+=====================================================================
+## 1. STATUS AT A GLANCE
+=====================================================================
+WORKS (verified in-game):
+- PASSTHROUGH mode with correct backend: stable 16+ min, thousands of ffxDispatch rc=0, zero errors.
+- FSR4 visible again when the game's own loader is staged as backend (see §3 root cause).
+- Synthetic tests (ffx_dispatchtest, ffx_fgtest) PASS on current build.
+- Standalone HUD test (hud_test.exe) PASSES; HUD hotkeys: Insert=show/hide, Delete=cycle log level, End=toggle mode live.
+- Installer/uninstaller scripts work end-to-end (tested via `cmd /c script.bat < input.txt`).
 
-## HARDWARE (this box — Windows 11 build 26200)
-- GPU A = RX 7900 XTX (RDNA3, 24GB), LUID {0x0000, 0x2A089} — renders the game. NO physical display attached.
-- GPU B = RX 9060 XT (RDNA4, 16GB), LUID {0x0000, 0x27214} — owns BOTH displays; will run upscaling/FG.
-- Both discrete AMD cards on the same PCIe root complex. No NVLink-class P2P.
+BROKEN (the open bug):
+- ACTIVE mode: GPU B device is REMOVED (0x887A0006) after the FIRST FRAMEGENERATION list executes.
+  PREPARE dispatches survive; first GENERATE kills devB; every later bounce fails (upB map 0x887A0005);
+  game shows alternating black frames and eventually crashes when entering gameplay.
 
-## ✅ TRANSFER PATH VALIDATED (the core feasibility question is ANSWERED)
-tools/xgpu_probe4.cpp prints **PASS: all 589824 bytes identical GPU A -> CPU RAM -> GPU B** at 512x288 RGBA8.
-Measured one-way per frame (single-pass, no pipelining yet):
-  - GPU A readback path : ~0.68 ms   (texture->readback buffer + fence)
-  - CPU memcpy hop      : ~0.03 ms   (~22 GB/s effective — this is the actual cross-GPU transfer)
-  - GPU B upload path   : ~0.58 ms   (upload buffer->texture + verify copy)
-  - TOTAL one-way       : ~1.29 ms @ 512x288; scales linearly -> ~2-3 ms @720p, ~4-6 ms @1080p.
-This is acceptable and pipelinable (overlap readback of frame N with render/upload of N+1). The design works.
+=====================================================================
+## 2. VERIFIED FACTS (with evidence) vs HYPOTHESES
+=====================================================================
+VERIFIED:
+1. Cyberpunk ships its own custom ~6.6MB amd_fidelityfx_dx12.dll (md5 49230ad9...) with embedded FFX
+   effect implementations. The thin SDK loader stub from signedbin is only 26KB.
+2. With the THIN STUB staged as backend: ffxCreateContext returns rc=2 for both FG-family contexts
+   (topType 0x20001 and 0x30001) → Cyberpunk hides FSR4 from the upscaler list. This was observed in
+   an actual game log, not inferred.
+3. With the GAME'S OWN LOADER staged as backend: both creates return rc=0 (observed in-game, passthrough
+   run), FSR4 is expected back; user's 16-min passthrough session ran clean with zero errors.
+   => ROOT CAUSE OF "FSR4 DISAPPEARS" = wrong backend loader, NOT the version resource and NOT our
+      forwarding logic (all queries forwarded verbatim, rc=0).
+4. ACTIVE-mode crash signature (from instrumented build 7af7f235 in-game log):
+     - PREPARE dispatches: bounce OK, ffxDispatch rc=0, list executes clean.
+     - First GENERATE: `ERROR: devB REMOVED after qB execute reason=0x887A0006` — i.e. AFTER we
+       ExecuteCommandLists the list FFX recorded into (our readback block is appended to that same list).
+     - All subsequent dispatches: `upB map hr=0x887A0005 devB_removed=0x887A0006` → bounce aborts,
+       outputs left stale (black frames), game later dies in gameplay.
+   => The illegal command is executed as part of the GENERATE list on GPU B. Which exact command: UNKNOWN.
+5. probe_common_barrier.exe (standalone, GPU B): transition with before-state COMMON(0) AND with
+   before-state UAV are BOTH legal — no device removal. Our readback barrier style is NOT the killer.
+6. probe_generate_list.exe (standalone replica of our full recorded sequence: input bounce for a
+   PRESENT-rewritten presentColor, FFX-style output-to-UAV transition, readback block with COMMON
+   before-state): executes CLEAN, no device removal, in all skip-flag combinations.
+   => Our own recorded commands are legal on this driver. The illegal command must be inside what
+      FFX ITSELF records during ffxDispatch (the probe only simulated a barrier for that part).
+7. Driver quirks (all verified by probes/in-game):
+   - Reset() on a fresh command list returns E_FAIL (0x80004005) but the list is usable — suppressed as known quirk.
+   - CreateCommittedResource with zero-initialized D3D12_RESOURCE_DESC fails E_INVALIDARG; SampleDesc.Count=1,
+     Format=UNKNOWN, Layout=ROW_MAJOR must be set explicitly for buffers.
+   - This SDK's ID3D12GraphicsCommandList::Reset takes 2 args (alloc, initialState); CreateCommandList takes 5
+     (nodeMask, type, allocator, initialState, riid). D3D12_CPU_DESCRIPTOR_HANDLE has .ptr (SIZE_T), no .Offset.
+   - GetGPUDescriptorHandleForHeapStart exists; ...ForDescriptorStart does NOT in this SDK version.
+   - CreateUnorderedAccessView returns void here — a bad desc can crash the driver instead of returning an error.
+   - ALL_BARRIERS and some UAV barrier forms are rejected by this AMD driver (earlier probe work).
+8. FFX FG dispatch struct (ffx_framegeneration.h): ffxDispatchDescFrameGeneration has exactly these
+   resource fields: presentColor + outputs[4]. PREPARE V2 has depth + motionVectors. No other resources.
+9. ffxConfigureDescFrameGeneration CONTAINS a `void* swapChain` field and a presentCallback (header fact).
 
-## ⚠️ CRITICAL FINDING: cross-adapter shared heaps are NOT supported here
-tools/xgpu_probe3.cpp queries `D3D12_FEATURE_DATA_D3D12_OPTIONS` on BOTH GPUs:
-  - `CrossNodeSharingTier = 0` (NOT_SUPPORTED)   and   `CrossAdapterRowMajorTextureSupported = 0`
-Consequence: any resource flagged `D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER` is rejected E_INVALIDARG.
-So the ONLY way to move a texture GPU A -> GPU B on this hardware is the **CPU RAM bounce** above
-(readback buffer on A -> Map/memcpy -> upload buffer on B). Do NOT re-attempt cross-adapter shared heaps.
+HYPOTHESES (NOT verified — do not build on these without evidence):
+A. "FFX holds the game's GPU-A swapchain from ffxConfigure and references it during GENERATE dispatch,
+   causing a cross-adapter violation that removes device B."
+   - Status: UNVERIFIED. We have NOT logged whether Cyberpunk passes a non-null swapChain to ffxConfigure,
+     nor proven FFX touches it at dispatch time. The previous session presented this as the root cause —
+     that was overreach. It remains the leading hypothesis because (6) rules out our commands and (4) shows
+     the removal happens on the GENERATE list specifically.
+   - How to verify: add one log line in ffxConfigure printing desc->type and, for type 0x20002 (FG configure),
+     the swapChain pointer value + presentCallback pointer. One game launch settles it.
+B. "The version resource (1.0.1.41314) matters for FSR4 detection." — UNVERIFIED; the verified cause is #2/#3.
+   The resource is embedded anyway (harmless, matches stock). Keep or drop later.
+C. "Black frames in menus are due to FG without motion vectors" — plausible but unverified; secondary issue.
 
-## 🔧 AMD DRIVER QUIRKS ON THIS BOX (cost hours; do not rediscover)
-These are real driver behaviors, NOT header bugs or test mistakes. All confirmed by isolated probes:
-1. **`CopyTextureRegion` with a BUFFER as source/dest via `SUBRESOURCE_INDEX` -> INVALID_CALL**
-   (0x887A0001), which then puts the device in removed state (subsequent calls return 0x887A0005).
-   FIX: for any buffer<->texture copy, use **`D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT`** with a filled-in
-   `PlacedFootprint` (Offset=0, Format=R8G8B8A8_UNORM, Width/Height, Depth=1, RowPitch=W*4). See BufLoc() in probe4.
-   Texture<->texture copies via SUBRESOURCE_INDEX work fine; buffer<->buffer CopyBufferRegion works fine.
-2. **`Map()` with range `{0, SIZE_MAX}` is rejected** (E_INVALIDARG 0x80070057). Pass an explicit byte count
-   (`D3D12_RANGE{0, BYTES}`) or `nullptr`. Confirmed in probe8: same buffer, {0,-1} fails, {0,BYTES} succeeds.
-3. **READBACK buffers can be created in COPY_DEST state and still Map fine** — no barrier to GENERIC_READ needed
-   for the CPU readback hop (probe7/8). UPLOAD buffers must be GENERIC_READ to Map; a copy SOURCE buffer must be
-   transitioned to COPY_SOURCE before CopyTextureRegion/CopyBufferRegion.
-4. **`D3D12_RESOURCE_DESC.SampleDesc.Count` MUST be set to 1** for buffers too — a zero-initialized desc has
-   Count=0 and CreateCommittedResource returns E_INVALIDARG (this silently broke every buffer in early probes).
-5. **`Reset()` on a FRESH command list returns E_FAIL (0x80004005) but the list is still fully usable** — Close
-   succeeds, commands execute correctly (verified tools/xgpu_probe15_reset_efail.cpp + barrier probes; probe4 always worked because
-   it ignored the HRESULT). Pattern: `SafeReset()` wrapper that logs once and continues. NEVER treat a failed Reset
-   as fatal on this box.
-6. **`D3D12_RESOURCE_STATE_ALL_BARRIERS` (0x80000000) is REJECTED in legacy transition barriers** — Close() fails
-   with E_INVALIDARG (verified tools/xgpu_probe16_barrier_allbarr.cpp). Must track each resource's actual state explicitly and use
-   concrete StateBefore values. Escape hatch for "unknown current state": a transition from `COMMON(0)` is accepted
-   even when the real state differs (driver does not validate; verified xgpu_probe18 case g: Close=0). Use it after
-   FFX has executed on our mirrors, whose final state we cannot see.
-7. **UAV barriers / transitions into UAV state are rejected for resources created WITHOUT
-   `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`** (E_INVALIDARG at Close — standard D3D12 rule, but it bit us twice:
-   our B-side mirrors AND the test's game textures). FFX records its OWN internal transitions into whatever command
-   list we hand it and WILL use resources as UAVs. Every texture that FFX may touch (mirrors + any resource passed in
-   a dispatch desc) must be created with `ALLOW_UNORDERED_ACCESS | ALLOW_RENDER_TARGET`. Real games set these flags;
-   our mirrors now do too (GetOrCreateMirror). EXCEPTION: depth-family formats — see quirk #8.
-8. **Depth-family formats can ONLY be created with `ALLOW_DEPTH_STENCIL` (or no flags) on this AMD driver.**
-   For R32G8X24_TYPELESS (0x13), D32_FLOAT_S8X24_UINT (0x14) & co: ALLOW_UNORDERED_ACCESS -> E_INVALIDARG,
-   ALLOW_RENDER_TARGET -> E_INVALIDARG, DS+UAV -> E_INVALIDARG. Only `DS` and `none` succeed (verified desc_probe2
-   on BOTH GPUs). Cyberpunk's FG PREPARE passes its depth as R32G8X24_TYPELESS with srcFlags=0x2 — so mirrors for
-   depth-family formats must PRESERVE the source DS flag, not force UAV/RT. GetOrCreateMirror has an
-   IsDepthFamilyFormat() branch that does exactly this (task 7b).
-9. **CopyTextureRegion into a row-major buffer is REJECTED when the footprint format is a TYPELESS depth-family
-   format** (0x13/0x14/...) — Close() fails E_INVALIDARG regardless of from-state (DEPTH_READ, PSR|NPSR, COMMON all
-   fail; verified desc_probe3h on GPU A). The TYPED view works for every from-state: use R32_FLOAT as the footprint
-   format when copying a 0x13/0x14/0x15/0x16 texture to a buffer. CopyFormatFor() maps all depth-family formats to
-   their typed sibling (task 7b — this was THE in-game PREPARE bug: our pass-through kept 0x13 and every batched
-   A-readback list failed at Close).
-10. **A command list whose Close() FAILED is permanently poisoned** — subsequent Reset() returns E_INVALIDARG forever
-    (verified desc_probe3f P4). The "Reset E_FAIL on fresh list" quirk (#5) only applies to FRESH lists; never record
-    into a list after a failed Close. (In practice we now avoid the failure entirely via #8/#9, but if you ever see
-    `clA close` errors cascade across every dispatch, this is why.)
+=====================================================================
+## 3. THE FSR4-DISAPPEARANCE FIX (done, verified)
+=====================================================================
+- dist/install.bat now stages the GAME'S OWN original loader as upperscale_real_loader.dll (backed up to
+  upperscale_backup_amd_fidelityfx_dx12.dll on first install; uninstall restores it). The thin SDK stub is
+  NO LONGER part of the package.
+- Verified in-game: passthrough run with correct backend → both ffxCreateContext rc=0, stable session.
 
-## ✅ TASK 7b DONE: REAL-GAME VALIDATION IN CYBERPUNK 2077 (FSR4 + FG)
-Staged the proxy into Cyberpunk's bin/x64 (original loader kept as upperscale_real_loader.dll backend; ini with
-enable=1, gpu_luid_low=0x27214). In-game log (upperscale.log in game dir):
-- mode=ACTIVE luid={0,27214}; GPU-B device created: "AMD Radeon RX 9060 XT"; both FFX contexts swapped to B.
-- **ffxDispatch type=0x20004 (FRAMEGENERATION_PREPARE v1) rc=0** and **type=0x20003 (FRAMEGENERATION) rc=0**,
-  zero [xgpu] errors, per-frame stats present (frame_total ~3-7ms). This is the full goal: real FSR4 FG running on
-  GPU B inside a shipping game.
-- Cyberpunk specifics learned: it uses PREPARE **v1** (not V2); its "depth" input is R32G8X24_TYPELESS 600x1248
-  (varies with render resolution) state=PIXEL_COMPUTE_READ(0xC), MVs are a separate color texture; FFX's declared
-  format field can differ from the resource's real desc format — always trust GetDesc().
-- ⚠️ Pre-existing game crash: Cyberpunk 2.31 crashes ~54s after launch on this dual-GPU box REGARDLESS of proxy
-  (verified with stock loader, same world position/timing). Not our bug; limits in-game sessions to the first minute,
-  which is enough for FFX validation since dispatches start immediately.
+=====================================================================
+## 4. ACTIVE-MODE CRASH — INVESTIGATION STATE
+=====================================================================
+Timeline of what was tried (all builds listed by md5):
+- v9 auto-reset + PREPARE-list fixes: did NOT fix the crash.
+- Copy-backs moved from "appended to game's open list" to our own GPU-A queue: did NOT fix it.
+- 7af7f235 (current build/ artifact): PRESENT-state inputs rewritten to PIXEL_COMPUTE_READ before being
+  declared to FFX + device-removed instrumentation after every execute. In-game result: SAME crash at the
+  same spot (first GENERATE list). So the PRESENT rewrite was not sufficient — consistent with fact #6
+  (our commands are legal; the killer is inside FFX's own recorded passes).
 
-## DEBUGGING LESSONS (task 7b — cost many cycles)
-- `D3D12_RESOURCE_DIMENSION`: BUFFER=1, TEXTURE1D=2, **TEXTURE2D=3**, TEXTURE3D=4. We misread dim=3 as "3D" for a
-  week and built an entire wrong theory (RT-illegal-on-3D) on it. Grep the enum before theorizing.
-- `LUID` is `{DWORD LowPart; LONG HighPart}` — **LowPart FIRST**. Aggregate-init {0, 0x27214} silently targets a
-  nonexistent adapter (EnumAdapterByLuid -> 0x887A0002). Use named fields.
-- When an in-game failure contradicts your probe, suspect the PROBE first: our desc_probe3b/3e failed on everything
-  because (a) >1MB textures need ROW_MAJOR layout and (b) readback buffers must be sized from GetCopyableFootprints'
-  slice size (row-pitch padded), not W*H*bpp. probe4/probe15 worked because they got both right.
-- Standalone probes that replicate the proxy's exact sequence (same layouts, flags, buffer sizing, SafeReset pattern)
-  are worth their weight in gold — desc_probe3g/3h isolated quirk #9 in minutes once they were faithful.
+Ruled out so far: our readback barriers (#5), our full recorded sequence in isolation (#6), stale event
+state, poisoned allocators.
 
-## ✅ CORE ASSUMPTION PROVEN (ffx_bindtest PASS on BOTH GPUs)
-tools/ffx_bindtest.cpp loads the REAL signed `amd_fidelityfx_upscaler_dx12.dll` (FSR4 v4.1.1), creates a
-D3D12 device BY LUID, and calls its `ffxCreateContext`. Result: **PASS on both GPU A (7900 XTX) and
-GPU B (9060 XT)** — context created rc=0, provider version query returns "4.1.1", clean destroy.
-This proves the whole architecture at the API level: we CAN bind FFX to a LUID-selected device.
+Remaining suspects (in priority order):
+1. Something FFX records internally for GENERATE that references a GPU-A resource (swapchain hypothesis A,
+   or an internal resource created before the device swap, or a fence/event object from the game's device).
+2. The presentCallback: if Cyberpunk registers one and FFX invokes it during dispatch on devB with
+   GPU-A resources in its params — same class of violation.
 
-Key facts learned building it (do not rediscover):
-- The signed upscaler imports `amdxc64.dll` + `dxgi.dll` (AMD driver runtime) — present in System32, loads fine.
-- `ffxQuery(GET_VERSIONS)` is TWO-PHASE: call 1 with only `outputCount` set -> returns count; call 2 with
-  `versionIds`+`versionNames` arrays filled to get the ids/names. If you forget `outputCount`, count reads 0.
-- Available upscaler versions on this box: **4.1.1 (FSR4)**, 3.1.5, 2.3.4. Use id from version[0] in an
-  `ffxOverrideVersion` node chained into the create-desc for FSR4.
-- Create-desc chain a game builds: `ffxCreateContextDescUpscale -> [ffxOverrideVersion] -> ffxCreateBackendDX12Desc{device} -> (optional allocCallbacks)`. The `.device` in the backend node is THE POINTER WE SWAP to GPU B.
-- If you install custom resource-allocator callbacks, you MUST honor `pHeapProps->Type` (FFX requests UPLOAD for mappable buffers); forcing DEFAULT makes FFX crash inside create. Simplest: don't install alloc callbacks at all — let FFX use its own default allocator on the backend device (what real games do).
+Decisive experiments for next session (cheap → expensive):
+E1. Log ffxConfigure FG desc fields (swapChain, presentCallback pointers). One launch. Kills/keeps hypothesis A.
+E2. In xgpuInterceptDispatch, for GENERATE only: execute FFX's recorded list WITHOUT our readback block
+    appended (close+execute clB right after rd() returns), check devB health before doing readbacks on a
+    second list (hub already has allocB2/clB2 fields declared — see §6). If devB dies without our block →
+    100% FFX-internal. (probe_generate_list already suggests this, but in-game confirmation is the proof.)
+E3. If E1/E2 confirm FG-on-B is fundamentally incompatible with Cyberpunk: implement fg=0 properly (§7) and
+    ship it as default for this game; cross-GPU offload stays available for standalone upscale contexts.
 
-## ✅ PROXY DLL SKELETON BUILT + VERIFIED (task 4b DONE)
-src/proxy/upperscale_proxy.cpp builds `build/amd_fidelityfx_dx12.dll` (drop-in for AMD's loader).
-Exports EXACTLY the 5 FFX symbols (+ internal upperscaleGetState helper). Two modes, both SMOKE-PASS:
+=====================================================================
+## 5. FILE STATE (as of handoff)
+=====================================================================
+Repo: C:\Users\mrmih\Playground\AI\upperscale, branch main, HEAD=4ca53c5 (pushed to origin).
+Uncommitted changes:
+- M .gitignore            (build/, *.obj/*.res/*.i/preproc.err, _input.txt, _t_*.bat, _test_*.bat, _repro.bat)
+  !! third_party/ is NOT ignored and is 3.4GB — MUST add `third_party/` to .gitignore before committing.
+- M README.md             (installer/HUD/config docs added; status section still says "crashes" — update after fix)
+- M src/proxy/upperscale_proxy.cpp   (fg config parsing, g_cfgFgOnB publish in DllMain, version banner v9)
+- M src/proxy/upperscale_xgpu.cpp    (PRESENT rewrite effState[], device-removed checks, upB map detail log,
+                                      allocB2/clB2 struct fields [UNBUILT], PRESENT-rewrite note log [UNBUILT])
+- M tools/upperscale_config.cpp      (CmdSet argv fix: argc-2/argv+2; ResolveAdapter accepts decimal index or hex LUID)
+Untracked new files:
+- src/proxy/upperscale_overlay.{h,cpp}   (GDI layered HUD, worker thread, RegisterHotKey hotkeys)
+- src/proxy/upperscale_version.rc        (version resource 1.0.1.41314 "AMD FidelityFX")
+- tools/hud_test.cpp                     (standalone overlay smoke test — PASSES)
+- tools/backend_probe.cpp                (loader query probe; superseded by the two probes below)
+- tools/probe_common_barrier.cpp         (PASSES: COMMON before-state legal on GPU B)
+- tools/probe_generate_list.cpp          (PASSES: full replica of our recorded GENERATE sequence is legal)
+- dist/                                  (installer package — see §8; contains stale _input.txt, delete it)
 
-- **PASSTHROUGH** (default): forwards all 5 calls untouched to AMD's real loader (bundled as
-  `upperscale_real_loader.dll` next to us, or UPPERSCALE_REAL_LOADER path). Verified: FSR4 context
-  created on GPU A, provider "4.1.1", clean destroy — behaviorally identical to AMD's DLL. This is the
-  SAFE first in-game test (proves drop-in works without changing where FFX runs).
-- **ACTIVE** (UPPERSCALE_ENABLE=1 + UPPERSCALE_GPU_LUID=<hex>): walks the pNext desc chain on create/query,
-  finds the backend-DX12 node, SWAPS its ID3D12Device* for a device we created BY LUID on GPU B. Verified:
-  "created GPU-B device by LUID {0,27214}: AMD Radeon RX 9060 XT" + "SWAP: backend device A -> B", FSR4
-  context bound to GPU B rc=0, provider "4.1.1".
+Build artifacts:
+- build/amd_fidelityfx_dx12.dll = 7af7f235911b7ae8bf449380efe7b704  (PRESENT rewrite + instrumentation;
+  does NOT include the unbuilt struct fields / note log — rebuild before next in-game test)
+- build/upperscale_config.exe = 7d6cbe1ba2a5ea14fc8038649c4fcfbd   (= dist copy, verified identical)
+- build/hud_test.exe, build/probe_common_barrier.exe, build/probe_generate_list.exe
+- build/smoke/ffx_dispatchtest.exe + ffx_fgtest.exe (both PASS on 7af7f235)
 
-tools/ffx_smoke.cpp is the harness (simulates a game on GPU A, loads our DLL, checks upperscaleGetState).
-Run it from a dir containing: amd_fidelityfx_dx12.dll (ours) + upperscale_real_loader.dll (AMD's loader) +
-the effect DLLs (upscaler/framegeneration) — see build/smoke/ for the working layout.
+Game dir staging: C:\Program Files (x86)\Steam\steamapps\common\Cyberpunk 2077\bin\x64
+- amd_fidelityfx_dx12.dll = 7af7f235 (staged), upperscale_real_loader.dll = game's own loader,
+  upperscale.ini: enable=1 log=3 gpu_luid_low=0x27214. NO game process running at handoff time.
 
-Config (env or upperscale.ini [proxy] in CWD): UPPERSCALE_ENABLE, UPPERSCALE_GPU_LUID(_HI),
-UPPERSCALE_REAL_LOADER, UPPERSCALE_LOG (0 off / 1 create+destroy / 2 verbose). Log -> <CWD>\upperscale.log.
-Env vars are read FIRST, then the ini OVERRIDES them if upperscale.ini exists in CWD — so a stale ini silently
-wins over env. tools/upperscale_config.exe (list/set/show) generates the ini; verified ini-only config works
-(no env needed). NOTE: the original ini parser had a bug — `stricmp(p,"[proxy]")` never matched because fgets
-leaves "\r\n" on the line, so inProxy stayed 0 and NO ini was ever parsed (env vars masked it in our tests).
-Fixed by stripping trailing CR/LF/whitespace before comparing. If you see mode=PASSTHROUGH despite a valid ini,
-check this.
+dist/ currently holds amd_fidelityfx_dx12.dll = f38dde51 (STALE — older than build/'s 7af7f235).
+Re-copy from build/ after the final fix.
 
-⚠️ Windows DLL search order gotcha (cost a debug cycle): LoadLibraryA("name.dll") searches the EXE's own dir
-before CWD. When running ffx_smoke.exe, put it in the SAME dir as our proxy + real loader, or pass an explicit
-UPPERSCALE_REAL_LOADER path. The proxy itself resolves its bundled real-loader relative to ITS OWN module dir
-(GetModuleFileNameA(g_hInst)), which is correct for the drop-in case (proxy sits next to the game's DLLs).
+=====================================================================
+## 6. CODE NOTES / TRAPS
+=====================================================================
+- XGpuHub has allocB2/clB2 fields declared but NO creation code and no usage yet (dead weight, unbuilt).
+  Either complete them for experiment E2 or delete the fields before rebuilding.
+- g_cfgFgOnB is parsed (ini key "fg", env UPPERSCALE_FG) and published in DllMain, BUT ffxDispatch never
+  consults it — fg=0 currently does NOTHING. Wiring it up is §7 item 1.
+- Log file upperscale.log opens in APPEND mode; session boundaries = "=== upperscale proxy loaded vN ===" banners.
+- MSVC C++ mode: no C99 compound literals; struct name is UpperscaleStats (two p's).
+- Batch scripts: literal "(x86)" breaks for/if parsing → store paths in variables first; files MUST be CRLF;
+  non-ASCII chars (em-dash) break the parser under cp850 — keep .bat pure ASCII.
+- Bash printf mangles backslashes when creating .bat files — use write_file + `sed -i 's/$/\r/'` or Python.
+- Launching Cyberpunk: terminal tool with background=true, NEVER shell "&". Kill before staging:
+  powershell Get-Process Cyberpunk2077,REDprelauncher | Stop-Process -Force.
 
-## ✅ TASK 5 DONE: CROSS-GPU ffxDispatch WORKS END-TO-END (ACTIVE mode)
-src/proxy/upperscale_xgpu.{h,cpp} (~670 lines) implements the whole cross-GPU dispatch in one call
-(`xgpuInterceptDispatch`), called from the proxy's ffxDispatch in ACTIVE mode. Per upscale dispatch:
-1. For each non-null input (color/depth/MV/exposure/reactive/transparency): synchronous RAM bounce A->B —
-   barrier to COPY_SOURCE on our own GPU-A CL, T2T into readback buffer (PLACED_FOOTPRINT), fence+wait,
-   Map/memcpy into B upload buffer, T2T into a cached B-side mirror texture, restore declared state.
-2. Output: FFX is pointed at a B-side mirror of the game's output texture instead of the original.
-3. We hand FFX OUR GPU-B command list (SafeReset'd); real ffxDispatch records compute into it; we append an
-   output readback to the SAME open list, Close+execute on our GPU-B queue, fence+wait.
-4. CPU hop: rbB -> next slot of a 3-slot A-side UPLOAD ring (game may still be executing N-1's copy-back).
-5. Copy-back is recorded into the GAME'S command list (still open mid-recording) with symmetric barriers around
-   its declared state; desc fields are restored exactly afterwards (per-field wasSwapped tracking).
+=====================================================================
+## 7. EXACT NEXT STEPS (in order)
+=====================================================================
+1. Add ffxConfigure logging for FG configure desc (swapChain + presentCallback pointers). Rebuild, stage,
+   one in-game launch (ACTIVE), read log, KILL THE GAME. → settles hypothesis A.
+2. Implement experiment E2 (execute FFX's GENERATE list without our readback block; check devB health first).
+3. Based on 1+2: either fix the specific violation or implement fg=0 properly:
+   - In ffxCreateContext: if g_cfgFgOnB==0 and topType is FG-family (effect id 0x2xxxx/0x3xxxx), do NOT swap
+     the backend device → context stays native on GPU A; its dispatches must then be forwarded untouched.
+   - In ffxDispatch: forward as-is any dispatch whose context was not swapped (track per-context flag in CtxInfo).
+   - Cyberpunk's FSR4 pipeline is entirely FG-family contexts, so fg=0 ≈ passthrough there; standalone upscale
+     contexts still offload cross-GPU. Set default fg=0 for shipping until the crash is fixed.
+4. Rebuild (include or remove allocB2/clB2), run synthetic tests, stage, in-game test ACTIVE (and fg=0 mode),
+   KILL THE GAME after each test.
+5. Update README status section with final state; re-copy final DLL into dist/; delete dist/_input.txt.
+6. Add `third_party/` to .gitignore (3.4GB SDK — never commit). Commit everything, push to origin/main.
 
-VERIFIED (tools/ffx_dispatchtest.exe, 512x288 RGBA16F+D32+R16G16F -> 768x432):
-- PASSIVE control (FFX on GPU A): rc=0, all 331776 output px non-zero.
-- ACTIVE (FFX on GPU B via proxy): rc=0, all px non-zero; per-pixel diff vs passive: RMS 0.0217, max 0.98 at
-  528/331776 px (>0.01) — normal cross-GPU float precision noise. Cross-GPU FSR4 output is correct.
-- Per-frame timing (steady state): inputs ~4.6ms, ffx_record ~6.8ms (first call includes shader compile: 1.2s),
-  capture+copyback ~1.4ms => ~13ms total @512x288. Synchronous v1 — task 6 pipelines this.
+Build command:
+  cd src/proxy && source ../../build/msvc_env.sh >/dev/null 2>&1; export MSYS_NO_PATHCONV=1
+  cl.exe /nologo /EHsc /O2 /TP upperscale_proxy.cpp upperscale_xgpu.cpp upperscale_overlay.cpp \
+    /Fe:../../build/amd_fidelityfx_dx12.dll /LD "/link" upperscale_version.res d3d12.lib dxgi.lib user32.lib gdi32.lib
 
-Test gotcha found while verifying: the test originally passed its command list to ffxDispatch WITHOUT resetting it
-after a prior execute (real games reset every frame) -> FFX recorded into an already-executed list -> passive mode
-crashed at ExecuteCommandLists. Fixed in the test; not a proxy bug.
+Stage command (GAME="/c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077/bin/x64"):
+  kill procs; cp build/amd_fidelityfx_dx12.dll "$GAME/" ; rm -f "$GAME/upperscale.log"
 
-## ✅ TASK 6a DONE: FRAME GENERATION DISPATCH WORKS END-TO-END (ACTIVE mode)
-xgpuInterceptDispatch now handles ALL four dispatch node types: UPSCALE, UPSCALE_GENERATEREACTIVEMASK,
-FRAMEGENERATION_PREPARE_V2 (+ deprecated v1), and FRAMEGENERATION. Restructured for up to 4 outputs per
-dispatch (FG generates up to 4 frames): multi-output readback into one rbB buffer at computed offsets, each
-output hops to its own A-side upload ring slot (ring grew 3 -> 12 slots = 4 outputs x 3 in flight), and the
-copy-backs are recorded per-output into the game's command list.
+Launch: cd to game dir, run ./Cyberpunk2077.exe with terminal background=true + notify_on_complete.
+Log check after ~90s: head -1 log (banner), grep -cE "REMOVED|ERROR", tail of log; then KILL THE GAME.
 
-FG flow a game runs (from fsrapirendermodule.cpp ~1490-1660): ffxConfigure(FG config) every frame, then
-ffxDispatch(PREPARE_V2 {depth, MV}) — dilation passes write FFX-internal resources on B, NO outputs to bounce
-back — then ffxDispatch(FRAMEGENERATION {presentColor -> outputs[0..n]}). In non-swapchain mode the game sets
-FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY and supplies its own output texture (what our test does;
-real games with a swapchain use the FG-swapchain context instead — see OPEN QUESTION).
+=====================================================================
+## 8. DELIVERABLES STATE (user's standing request)
+=====================================================================
+- Debug overlay with frame times + stats: DONE (built, unit-tested; ShowWindow fix in current build).
+- Self-contained installer folder dist/: install.bat + uninstall.bat + proxy DLL + config exe — scripts work;
+  DLL copy is stale until step 5 above. Usage documented in README.md.
+- README: updated with installer/HUD/config docs; status section needs final update after the crash fix.
+- GitHub push: PENDING (blocked on .gitignore for third_party/ and final build).
 
-VERIFIED (tools/ffx_fgtest.exe, 512x288 depth+MV + 768x432 presentColor -> generated frame):
-- FG context created through proxy rc=0, provider "3.1.6" (FG version id differs from upscaler's!).
-- 5 frames: PREPARE_V2 rc=0 + FRAMEGENERATION rc=0 every frame; log shows both types intercepted cross-GPU
-  (type=0x2000c and type=0x20003), depth/MV/presentColor bounced A->B, generated frame captured B->A.
-- Generated output: 331761/331776 px non-zero -> PASS.
-
-⚠️ FG gotcha (cost a debug cycle): ffxQuery(GET_VERSIONS) is EFFECT-SPECIFIC — query with the FRAMEGENERATION
-createDescType to get FG version ids. Passing an UPSCALE version id into an FG create-desc override node returns
-FFX_API_RETURN_NO_PROVIDER (rc=4). Same two-phase pattern, just a different createDescType per effect.
-
-## SDK 10.0.26100 TYPE DIFFERENCES (this box's um/d3d12.h — grep before assuming)
-- `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` (NOT the modern short name `D3D12_PLACED_FOOTPRINT`).
-- No `DXGI_FORMAT_R32G8X24_UINT` constant.
-- `GetCopyableFootprints(desc, sub0, count, baseOffset, fp[], rows[], rowPitch[], sliceSize[])` — the OLD signature
-  (UINT* rows, UINT64* pitch/slice), not the modern single-total form.
-- No named `D3D12_RESOURCE_STATE_ALL_BARRIERS` constant (#define it as 0x80000000 if you need the value at all —
-  but see quirk #6: this driver rejects it in barriers anyway).
-- Barrier union member is `UAV` (uppercase), not `Uav`.
-- `D3D12_RESOURCE_ALIASING_BARRIER` has NO State member in this header.
-
-## ✅ EXPORT TABLE (all 3 effect DLLs identical)
-tools/dump_exports.cpp (rewritten to read PE from disk — LoadLibraryExA is unreliable here) shows each of
-loader/upscaler/framegeneration exports EXACTLY 5 symbols: `ffxConfigure, ffxCreateContext, ffxDestroyContext, ffxDispatch, ffxQuery`. Our proxy must export these same 5. The loader `LoadLibraryA`s effect DLLs by name (upscaler/FG/denoiser/radiancecache) — our proxy replicates that routing + adds the device swap.
-
-## ARCHITECTURE (decided, transfer path now proven)
-DLL replacement (OptiScaler-proven pattern):
-1. Drop our `amd_fidelityfx_dx12.dll` into the game folder. Game loads it thinking it's AMD's.
-2. Intercept `ffxCreateContext(device, ...)`: create OUR OWN D3D12 device on GPU B by LUID (bypasses Windows GPU
-   preference), pass THAT to the real FFX context. Keep a reference to the game's original device (GPU A) for reading its textures.
-3. On each `ffxDispatch(...)`: game passes input textures (color/depth/MV, resident on GPU A). Move them via the
-   validated CPU RAM bounce: CopyTextureRegion(texA -> readback buffer A, PLACED_FOOTPRINT) + fence; Map/memcpy to a
-   pinned/upload buffer on B; CopyTextureRegion(upload buffer B -> texB, PLACED_FOOTPRINT); run real FSR4 on GPU B.
-   Return the output texture (resident on GPU B — see OPEN QUESTION about present path).
-4. Double/triple buffer so GPU B upscales frame N while GPU A renders/ships frame N+1 (hide copy latency).
-
-FFX API flow (from vendored SDK headers): game -> `ffxCreateContext` / `ffxDispatch`; resources passed via backend
-callbacks; DX12 backend in `api_ffx_api_dx12.h`. AMD loader DLL is a ~26KB stub that loads the real upscaler/FG DLLs —
-our proxy must match its export table (use tools/dump_exports.cpp to enumerate it).
-
-## WHY THIS BEATS THE ALTERNATIVES (user-confirmed positioning, for README)
-- **OptiScaler**: good at rerouting FFX to another GPU, but it CANNOT transfer motion vectors cross-GPU — so real
-  frame generation is out of reach there. We bounce depth + MVs via RAM, which makes true FG on GPU B possible.
-- **Loosless Scaling**: applies filters over frames (frame-level post-processing), not a real FFX reroute with MVs.
-- Our approach intercepts the actual FFX dispatch calls and moves the real inputs (color/depth/MV) — so both
-  upscaling AND frame generation run natively on GPU B with correct motion data.
-
-## OPEN QUESTION (resolve early, affects design)
-**Where does the upscaled OUTPUT get presented?** GPU B owns the displays but has no physical monitor in the usual
-sense; GPU A renders. If the game presents via a swapchain on its own (GPU-A) device, our GPU-B output would need to
-cross back B->A (a second RAM bounce). If it can present from GPU B directly (GPU B owns displays), the output stays
-put — only inputs cross A->B. Investigate how the target game's swapchain/present is bound before finalizing transfer
-design. This determines 1 vs 2 bounces per frame.
-
-## REPO LAYOUT
-- third_party/FidelityFX-SDK/   — AMD official SDK clone (GITIGNORED — not in git; it's a full repo itself).
-  If missing, re-clone: `git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git third_party/FidelityFX-SDK`.
-  Signed FSR4 DLLs in Kits/FidelityFX/signedbin/: amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll,
-  amd_fidelityfx_framegeneration_dx12.dll. Headers in Kits/FidelityFX/api/include/. HLSL FG source also present.
-- third_party/dx-samples/       — Microsoft DirectX-Graphics-Samples clone (D3D12LinkedGpus = reference; uses affinity layer).
-- tools/device_probe.cpp        — enumerate DXGI adapters, print LUIDs, create D3D12 device by LUID. WORKS.
-- tools/xgpu_test.cpp           — original cross-adapter attempt. OBSOLETE (cross-adapter dead); keep for history.
-- tools/xgpu_probe2.cpp         — isolates which cross-adapter heap configs work. Output build/probe2_out.txt.
-- tools/xgpu_probe3.cpp         — **capability probe.** CrossNodeSharingTier=0 on both GPUs -> cross-adapter dead. WORKS.
-- tools/xgpu_probe4.cpp         — **THE VALIDATED TRANSFER TEST.** RAM-bounce A->B round-trip, PASS + timing. WORKS.
-- tools/xgpu_probe5..14.cpp     — isolation probes that found the driver quirks (buffer state matrix, Map range,
-  copy-type isolation, PLACED_FOOTPRINT fix). Keep as reference for the quirks section above.
-- tools/dump_exports.cpp        — list a DLL's exported functions by reading its PE from disk (LoadLibraryExA is
-  unreliable here). WORKS. Output build/*_exports.txt.
-- tools/ffx_bindtest.cpp        — **CORE DE-RISK.** Loads the REAL signed upscaler DLL, creates device by LUID, calls
-  ffxCreateContext. PASS on both GPUs (build/ffx_bindtest.exe [A|B]). WORKS.
-- tools/ffx_smoke.cpp           — **PROXY SMOKE TEST.** Simulates a game on GPU A, loads our proxy DLL, verifies the
-  device swap (ACTIVE) / passthrough. PASS in both modes. Run from build/smoke/ layout. WORKS.
-- src/proxy/upperscale_proxy.cpp + .def — **THE PROXY DLL** -> build/amd_fidelityfx_dx12.dll. 5 FFX exports, config
-  (env/ini), logging, passthrough + active device-swap modes. BUILT + SMOKE-PASS. (.def kept for reference; link here
-  rejects .def files with LNK1107 — exports come from __declspec(dllexport) instead.)
-- src/proxy/upperscale_xgpu.{h,cpp} — **CROSS-GPU TRANSFER HUB** (task 5). RAM-bounce A<->B, mirror cache, one-shot
-  dispatch intercept. BUILT into the same DLL; verified end-to-end by ffx_dispatchtest.
-- tools/ffx_dispatchtest.cpp — **END-TO-END DISPATCH TEST.** Simulates a game on GPU A (textures + fill), loads our
-  proxy, runs ffxCreateContext+ffxDispatch through it in ACTIVE or passive mode, reads the output back and checks
-  non-zero pixels. Run from build/smoke/: `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_dispatchtest.exe A out.bin`.
-- tools/ffx_fgtest.cpp — **END-TO-END FRAME GENERATION TEST (task 6a).** FG context + per-frame configure/PREPARE_V2/
-  FRAMEGENERATION through the proxy; verifies the generated frame is non-zero. Run from build/smoke/:
-  `UPPERSCALE_ENABLE=1 UPPERSCALE_GPU_LUID=0x27214 ./ffx_fgtest.exe out_fg.bin [frames]`.
-- tools/upperscale_config.cpp — **CONFIG CLI (task 7a).** `list` (adapters+LUIDs), `set <idx|0xLUID> --dir <game>`
-  (writes upperscale.ini), `show`. Build → build/upperscale_config.exe. Verified: ini it writes makes the proxy
-  enter ACTIVE mode with no env vars set.
-- tools/xgpu_probe15..19.cpp — driver-quirk isolation probes (Reset E_FAIL on fresh lists, ALL_BARRIERS/UAV rejection,
-  COMMON(0) escape hatch, full bounce pattern). Keep as reference for quirks #5-#7.
-- docs/, tests/, build/         — docs / test harness / build artifacts + msvc_env.sh. build/smoke/ = working proxy test dir.
-
-## BUILD COMMAND THAT WORKS (git-bash, MSVC 14.51 BuildTools)
-```
-cd C:/Users/mrmih/Playground/AI/upperscale
-source build/msvc_env.sh
-export MSYS_NO_PATHCONV=1
-cl.exe /nologo /EHsc /O2 /TP tools/xgpu_probe4.cpp /Fe:build/xgpu_probe4.exe \
-  "/link" "/LIBPATH:C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64" d3d12.lib dxgi.lib user32.lib
-./build/xgpu_probe4.exe > build/probe4_out.txt 2>&1; cat build/probe4_out.txt
-```
-Build gotchas (all hit and solved):
-- Use `/TP` to force C++ — MSYS mangles .cpp extension detection, cl treats it as C otherwise.
-- `MSYS_NO_PATHCONV=1` is REQUIRED for `/LIBPATH:C:\...` (backslash Windows path) or link mangles it into a .obj name.
-- In build/msvc_env.sh: PATH entries MUST be forward-slash MSYS form (`/c/Program Files ...`) so bash can traverse;
-  INCLUDE/LIB are native `C:\...` form for cl/link. (A backslash PATH entry silently breaks `which cl.exe`.)
-- Compiler: C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools, toolset 14.51.36231.
-- Windows SDK headers/libs at ...\Windows Kits\10\Include|Lib\10.0.26100.0 (also 10.0.22621.0 present).
-
-## THIS MACHINE'S d3d12.h IS OLD (um/, Windows-10-era) — API DIFFERENCES
-The installed header is NOT the modern shared/ one. Signatures that differ from what you'd expect:
-- `CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE, ...)` takes an ENUM directly (no D3D12_COMMAND_ALLOCATION_DESC struct).
-- No `OpenSharedResource` — it's **`OpenSharedHandle(HANDLE, REFIID, void**)`** on ID3D12Device.
-- `CreateSharedHandle(resource, securityAttrs, access, name, HANDLE*)` — 5 args (has a Name param).
-- `D3D12_TEXTURE_COPY_LOCATION{resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {subres}}` needs explicit Type + SubresourceIndex.
-- `CreateCommittedResource(props, heapFlags, desc, initialState, deniedDescs, iid)` — 6 args (no resource-flags slot).
-- `CopyTextureRegion(&dstLoc, x,y,z, &srcLoc, box*)`.
-- `D3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL, REFIID riid, void** ppDevice)` — 4 args; pass
-  `__uuidof(ID3D12Device)` (NOT nullptr) as the IID. No `D3D12_CREATE_DEVICE_DESC` in this header.
-- `IDXGIAffinityFactory` is NOT present in these headers (would need Agility SDK / newer Windows SDK).
-If you keep hitting E_INVALIDARG on a call that "should" work, suspect an old-header signature mismatch and grep the local um/d3d12.h for the exact declaration.
-
-## NEXT STEPS (in order)
-1. [x] Validate cross-GPU transfer path — DONE (probe4 PASS, ~1.3ms one-way @512x288).
-2. [x] De-risk: real signed FSR4 upscaler binds to a LUID device — DONE (ffx_bindtest PASS both GPUs).
-3. [x] Build src/proxy/ DLL skeleton + export table + passthrough/active modes — DONE (smoke PASS both modes).
-4. [x] **WIRE ffxDispatch cross-GPU transfer** — DONE (task 5; see "TASK 5 DONE" section above). ACTIVE mode runs
-   real FSR4 on GPU B with verified output parity vs passive control.
-5. [x] **Task 6a: frame generation dispatch types** — DONE (see "TASK 6a DONE" section above). PREPARE_V2 +
-   FRAMEGENERATION intercepted cross-GPU, verified end-to-end with ffx_fgtest.
-6. [x] **Task 6b/6c: async pipelining + latency stats** — DONE (commits 3239172, 9d4ac73). 6b = batched input bounce
-   (one A-readback + one B-upload per dispatch, 2 fence round-trips total instead of 2N); 6c = per-frame end-to-end
-   latency stats in the log (rolling max + EMA) with a session summary on context destroy. Full async overlap is
-   still future work; v1 remains synchronous but the bounce cost is now amortized across all inputs.
-7. [ ] **Resolve OPEN QUESTION** (output present path): does the target game present from GPU A or B, and does it use
-   the FG-swapchain context (which we do NOT intercept today)? Determines whether copy-back is needed in steady state
-   and what extra interception the swapchain-context flow needs. (v1 always copies back — safe either way.)
-8. [x] **Config tool** — DONE: `tools/upperscale_config.cpp` → `upperscale_config.exe` (list / set / show).
-   Writes the `[proxy]` ini the proxy reads at load; verified end-to-end (ini-only, no env vars → mode=ACTIVE).
-9. [x] **End-to-end test in a real FSR-enabled game** — DONE (task 7b, see "TASK 7b DONE" section above). Cyberpunk
-   2077 with FSR4 + FG: PREPARE v1 + FRAMEGENERATION both rc=0 on GPU B, zero errors. Pre-existing ~54s game crash
-   (unrelated to proxy) limits session length but not validation.
-10. [x] **README.md** — DONE (build/run/troubleshoot + why-this table). Push to https://github.com/radumihai1/upperscale.git
-
-## STATUS SNAPSHOT (as of last update)
-- Repo at C:\Users\mrmih\Playground\AI\upperscale, git branch main. Remote origin = github radumihai1/upperscale
-  (authed via credential manager). Pushed to origin/main; verify with `git ls-remote origin main` vs local HEAD.
-- FidelityFX SDK vendored (signed FSR4 DLLs present). dx-samples cloned.
-- device_probe WORKS. xgpu_probe3 WORKS (cross-adapter = NOT_SUPPORTED, tier 0). **xgpu_probe4 PASS** (transfer validated).
-- Cross-GPU transfer is a CPU RAM bounce (readback->memcpy->upload), ~1.3ms one-way @512x288. Driver quirks documented above.
-- **ffx_bindtest PASS both GPUs** — real signed FSR4 v4.1.1 binds to LUID-selected device. Core architecture proven.
-- **Proxy DLL BUILT + SMOKE-PASS (both PASSTHROUGH and ACTIVE modes).** build/amd_fidelityfx_dx12.dll exports the 5 FFX
-  symbols; active mode swaps backend device to GPU B by LUID.
-- **TASK 5 DONE: cross-GPU ffxDispatch verified end-to-end** — ACTIVE mode bounces inputs A->B, runs real FSR4 on GPU B,
-  copies output back into the game's CL. Output parity vs passive control confirmed (RMS diff 0.0217). ~13ms/frame @512x288
-  synchronous v1. New driver quirks #5-#7 + SDK type differences documented above — read them before touching barriers.
-- **TASK 6a DONE: FG dispatch types verified end-to-end** — PREPARE_V2 (depth+MV) and FRAMEGENERATION (presentColor ->
-  outputs[0..3]) intercepted cross-GPU; ffx_fgtest PASS (5 frames, generated frame non-zero). Multi-output readback +
-  12-slot output ring in place. FG version query gotcha documented above.
-- **TASK 7a DONE: config tool + README** — upperscale_config.exe (list/set/show) writes the [proxy] ini; fixed a real
-  bug where the proxy's ini parser never matched "[proxy]" (trailing \r\n), so ini config was silently dead until now.
-  Verified ini-only → mode=ACTIVE. README.md written (build/run/troubleshoot + why-this table).
-- **TASK 6b/6c DONE** — batched input bounce (2 fence round-trips per dispatch) + per-frame latency stats in log.
-- **TASK 7b DONE: real-game validation PASS** — Cyberpunk 2077 FSR4+FG running on GPU B through the proxy; PREPARE v1
-  and FRAMEGENERATION both rc=0, zero errors (see "TASK 7b DONE" section). New driver quirks #8-#10 documented above.
-- ⚠️ CURRENT STAGING STATE: Cyberpunk's bin/x64 currently contains OUR proxy as amd_fidelityfx_dx12.dll + the original
-  loader renamed upperscale_real_loader.dll + upperscale.ini (+ upperscale.log). To restore stock: delete those three
-  files and copy upperscale_real_loader.dll back to amd_fidelityfx_dx12.dll (or Steam "verify integrity"). The game dir
-  is writable without elevation.
-- Active next tasks = **OPEN QUESTION** (output present path / FG-swapchain context, NEXT STEPS item 7) and full async
-  pipelining of the bounce (overlap A-readback with GPU work; v1 is synchronous).
-
-## DO / DON'T
-- DO kill any background test processes after verifying (user is sensitive to leftover servers).
-- DO keep this file current; it is the resume point. Update STATUS SNAPSHOT + NEXT STEPS as you go, then commit+push.
-- DON'T vendor OptiScaler GPL code into our MIT/Apache project — use AMD's permissive FidelityFX SDK as reference + dependency only.
-- DON'T leave GUI/test apps running on the user's desktop after verification.
-- DON'T re-attempt cross-adapter shared heap placement — proven unsupported (CrossNodeSharingTier=0). Use the RAM bounce.
+User requirements to keep honoring: close the game after every test; document everything; put everything
+needed in one folder with usage docs; push to GitHub when done.

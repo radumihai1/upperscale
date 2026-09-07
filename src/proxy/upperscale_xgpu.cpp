@@ -19,6 +19,7 @@
 //   6. restores every field of the desc exactly as the game passed it.
 
 #include "upperscale_xgpu.h"
+#include "upperscale_overlay.h"   // g_upperscaleStats — live HUD stats (defined in upperscale_proxy.cpp)
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -52,6 +53,8 @@ struct XGpuHub {
     ID3D12CommandQueue*   qA, *qB;
     ID3D12CommandAllocator* allocA, *allocB;
     ID3D12GraphicsCommandList* clA, *clB;
+    ID3D12CommandAllocator* allocB2;   // second B list: readbacks run SEPARATE from FFX's recorded passes (diagnostic)
+    ID3D12GraphicsCommandList* clB2;
     ID3D12Fence*          fenceA, *fenceB;
     HANDLE                evA, evB;
     uint64_t              fenceValA, fenceValB;
@@ -70,6 +73,9 @@ struct XGpuHub {
     double                msInputs, msFfxRecord, msCapture;  // running sums (ms)
     double                msTotalMax;   // worst-case end-to-end ffxDispatch cost seen so far
     double                msTotalEma;   // steady-state estimate (EMA alpha=0.1) — the number that matters for latency
+    double                lastAnchorMs; // wall time of the previous "frame anchor" dispatch (HUD frame-time calc)
+
+    int                   cmdListType;  // 0 unknown, 1 graphics(direct), 2 compute-only — type of the game's list we append copy-backs into
 };
 
 // ---------------------------------------------------------------------------
@@ -227,13 +233,16 @@ static void Footprints(ID3D12Device* dev, const D3D12_RESOURCE_DESC* d, UINT mip
 
 // AMD driver quirk (Win11 26200, RDNA3/RDNA4): Reset() on a FRESH command list returns E_FAIL
 // (0x80004005) but the list is still fully usable — Close succeeds and commands execute.
-// Verified with tools/xgpu_probe15_reset_efail.cpp (instrumented probe4 replica). So: never treat a failed
-// Reset as fatal; log it once per list instead.
+// Verified with tools/xgpu_probe15_reset_efail.cpp (instrumented probe4 replica). So: never treat that
+// specific failure as fatal; log it once per list instead. ANY OTHER Reset failure means the list is
+// poisoned (e.g. a prior Close() failed) — recording into it is undefined behavior, so bail out.
 static int g_resetWarnedA = 0, g_resetWarnedB = 0;
-static HRESULT SafeReset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* alloc, int* warned) {
+static bool SafeReset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* alloc, int* warned) {
     HRESULT hr = cl->Reset(alloc, nullptr);
-    if (FAILED(hr) && !*warned) { *warned = 1; XLog("note: Reset returned 0x%08X on fresh list — known driver quirk, continuing", (unsigned)hr); }
-    return hr;   // caller must NOT bail on failure
+    if (SUCCEEDED(hr)) return true;
+    if (hr == E_FAIL && !*warned) { *warned = 1; XLog("note: Reset returned 0x%08X on fresh list — known driver quirk, continuing", (unsigned)hr); }
+    else { XLog("ERROR: Reset failed hr=0x%08X (list poisoned?) — aborting this dispatch", (unsigned)hr); return false; }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,8 +273,12 @@ XGpuHub* xgpuGetOrCreateHub(ID3D12Device* devA, ID3D12Device* devB) {
     hr = devA->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h->fenceA));
     if (SUCCEEDED(hr)) hr = devB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h->fenceB));
     if (FAILED(hr)) goto fail;
-    h->evA = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    h->evB = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    // AUTO-RESET events: SetEventOnCompletion sets the event exactly once per fence value and our
+    // WaitForSingleObject consumes it. (v10 bug: these were manual-reset and never Reset() — after
+    // the first completion every subsequent wait returned instantly, so we re-Reset command
+    // allocators while their lists were still in flight on the queue -> AMD driver crash ~frame 2.)
+    h->evA = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    h->evB = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     XLog("hub created: devA=%p devB=%p queues+lists+fences OK", (void*)devA, (void*)devB);
     if (g_nHubs < 8) g_hubs[g_nHubs++] = h;
     return h;
@@ -467,11 +480,27 @@ bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
     }
     if (nAct == 0) return true;   // all inputs null — nothing to bounce
 
+    // ---- effective declared state per input (what FFX will be told on GPU B) ----
+    // PRESENT-state inputs (FG presentColor = a swapchain backbuffer) must NOT be declared as-is:
+    // D3D12 has no "present" state for regular textures, and leaving our mirror in RENDER_TARGET
+    // while FFX reads it through an SRV is an illegal command -> AMD removes the device
+    // (0x887A0006). Rewrite to PIXEL_COMPUTE_READ — the read state FFX actually needs.
+    uint32_t effState[8] = {};
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!active[i]) continue;
+        if (inputs[i]->state == FFX_API_RESOURCE_STATE_PRESENT) {
+            static int presentRewrites = 0;
+            if (++presentRewrites <= 2) XLog("note: PRESENT-state input in[%d] rewritten to PIXEL_COMPUTE_READ for GPU-B mirror", i);
+        }
+        effState[i] = (inputs[i]->state == FFX_API_RESOURCE_STATE_PRESENT) ?
+                      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ : inputs[i]->state;
+    }
+
     // ---- Phase 1: ONE A-readback list for every input, single fence wait ----
     GrowBuffer(h, &h->rbA, &h->rbASize, h->devA, D3D12_HEAP_TYPE_READBACK,
                D3D12_RESOURCE_STATE_COPY_DEST, "A-readback", total);
     if (!h->rbA) return false;
-    SafeReset(h->clA, h->allocA, &g_resetWarnedA);   // E_FAIL on fresh list is a known quirk — continue
+    if (!SafeReset(h->clA, h->allocA, &g_resetWarnedA)) return false;   // E_FAIL on fresh list is a known quirk — continue
     for (int i = 0; i < nIn && i < 8; ++i) {
         if (!active[i]) continue;
         ID3D12Resource* srcA = (ID3D12Resource*)inputs[i]->resource;
@@ -511,13 +540,25 @@ bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
     h->qA->Signal(h->fenceA, h->fenceValA);
     if (FAILED(h->fenceA->SetEventOnCompletion(h->fenceValA, h->evA))) { XLog("ERROR: fence A event"); return false; }
     if (WaitForSingleObject(h->evA, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-A batch readback"); return false; }
+    {
+        HRESULT rmA = h->devA->GetDeviceRemovedReason();
+        if (rmA != S_OK) XLog("ERROR: devA REMOVED after input-bounce qA wait reason=0x%08X", (unsigned)rmA);
+    }
 
     // ---- Phase 2: CPU hop — all inputs rbA -> upB back-to-back (the RAM bounce), one Map/Unmap pair each ----
     GrowBuffer(h, &h->upB, &h->upBSize, h->devB, D3D12_HEAP_TYPE_UPLOAD,
                D3D12_RESOURCE_STATE_GENERIC_READ, "B-upload", total);
     if (!h->upB) return false;
     void* mUp = nullptr;
-    if (FAILED(h->upB->Map(0, nullptr, &mUp))) { XLog("ERROR: upB map"); return false; }
+    HRESULT hrMapB = h->upB->Map(0, nullptr, &mUp);
+    if (FAILED(hrMapB)) {
+        static int upbFailCount = 0;
+        if (++upbFailCount <= 3)   // detail on the first few, then quiet (this repeats every frame)
+            XLog("ERROR: upB map hr=0x%08X devA_removed=0x%08X devB_removed=0x%08X (fail #%d)",
+                 (unsigned)hrMapB, (unsigned)h->devA->GetDeviceRemovedReason(),
+                 (unsigned)h->devB->GetDeviceRemovedReason(), upbFailCount);
+        return false;
+    }
     for (int i = 0; i < nIn && i < 8; ++i) {
         if (!active[i]) continue;
         D3D12_RANGE r{offA[i], offA[i] + (SIZE_T)szFor[i]};
@@ -529,7 +570,7 @@ bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
     h->upB->Unmap(0, nullptr);
 
     // ---- Phase 3: ONE B-upload list for every input, single fence wait ----
-    SafeReset(h->clB, h->allocB, &g_resetWarnedB);   // E_FAIL on fresh list is a known quirk — continue
+    if (!SafeReset(h->clB, h->allocB, &g_resetWarnedB)) return false;   // E_FAIL on fresh list is a known quirk — continue
     for (int i = 0; i < nIn && i < 8; ++i) {
         if (!active[i]) continue;
         XGpuMirror* m = mFor[i];
@@ -560,7 +601,7 @@ bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
                 dst.SubresourceIndex = k;
                 h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             }
-            Barrier(h->clB, m->resB, D3D12_RESOURCE_STATE_COPY_DEST, FfxStateToD3d(inputs[i]->state));
+            Barrier(h->clB, m->resB, D3D12_RESOURCE_STATE_COPY_DEST, FfxStateToD3d(effState[i]));
             Barrier(h->clB, h->upB, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ);
         }
     }
@@ -571,9 +612,17 @@ bool xgpuBounceInputs(XGpuHub* h, FfxApiResource** inputs, int nIn) {
     h->qB->Signal(h->fenceB, h->fenceValB);
     if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) { XLog("ERROR: fence B event"); return false; }
     if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) { XLog("ERROR: timeout waiting GPU-B batch upload"); return false; }
+    {
+        HRESULT rmB = h->devB->GetDeviceRemovedReason();
+        if (rmB != S_OK) XLog("ERROR: devB REMOVED after input-bounce qB wait reason=0x%08X", (unsigned)rmB);
+    }
 
-    // ---- swap every non-null input to its B-side mirror (state field stays as declared) ----
-    for (int i = 0; i < nIn && i < 8; ++i) if (active[i]) inputs[i]->resource = mFor[i]->resB;
+    // ---- swap every non-null input to its B-side mirror; PRESENT-state inputs get the rewritten state ----
+    for (int i = 0; i < nIn && i < 8; ++i) {
+        if (!active[i]) continue;
+        inputs[i]->resource = mFor[i]->resB;
+        inputs[i]->state = effState[i];   // FFX sees the legal read state, not PRESENT
+    }
     return true;
 }
 
@@ -711,7 +760,7 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     }
 
     // ---- hand FFX our GPU-B command list and record (E_FAIL on fresh list is a known quirk) ----
-    HRESULT hr = SafeReset(h->clB, h->allocB, &g_resetWarnedB);
+    if (!SafeReset(h->clB, h->allocB, &g_resetWarnedB)) goto restore;   // poisoned list — abort
     *pCmdList = h->clB;
 
     double t1 = NowMs();
@@ -737,6 +786,7 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
                 }
             }
 
+        // ---- append output readbacks to the SAME open list FFX recorded into (only when there are outputs) ----
         if (totalNeed > 0) {
             GrowBuffer(h, &h->rbB, &h->rbBSize, h->devB, D3D12_HEAP_TYPE_READBACK,
                        D3D12_RESOURCE_STATE_COPY_DEST, "B-readback", totalNeed);
@@ -790,68 +840,117 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
                     }
                     off += need;
                 }
+            }
+        }
 
-                if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (output) failed"); }
+        // ---- ALWAYS close + execute clB after FFX returns, even when there are no outputs (PREPARE).
+        //      If we skip this for a 0-output dispatch the allocator stays "in use" and the NEXT
+        //      dispatch's Reset fails E_INVALIDARG -> poisoned list -> crash on frame 2. ----
+        {
+            HRESULT rmB = h->devB->GetDeviceRemovedReason();
+            if (rmB != S_OK) XLog("ERROR: devB REMOVED after ffxDispatch rc=%u reason=0x%08X - FFX recorded an illegal command", rc, (unsigned)rmB);
+        }
+        if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (post-ffx) failed"); }
+        else {
+            ID3D12CommandList* lists[] = { h->clB };
+            h->qB->ExecuteCommandLists(1, lists);
+            h->fenceValB++;
+            h->qB->Signal(h->fenceB, h->fenceValB);
+            if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
+            else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B ffx execute");
+            {
+                HRESULT rmB2 = h->devB->GetDeviceRemovedReason();
+                if (rmB2 != S_OK) XLog("ERROR: devB REMOVED after qB execute reason=0x%08X - illegal command in our list", (unsigned)rmB2);
+            }
+
+            // CPU hop: each captured output -> its own A-side upload ring slot
+            uint64_t off2 = 0;
+            for (int i = 0; i < nOut && h->rbB; ++i) {
+                if (!outSwapped[i]) continue;
+                ID3D12Resource* srcB = (ID3D12Resource*)outputs[i]->resource;
+                D3D12_RESOURCE_DESC d = srcB->GetDesc();
+                bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+                uint64_t need = 0;
+                UINT mips = 1;
+                if (isBuf) need = d.Width;
                 else {
-                    ID3D12CommandList* lists[] = { h->clB };
-                    h->qB->ExecuteCommandLists(1, lists);
-                    h->fenceValB++;
-                    h->qB->Signal(h->fenceB, h->fenceValB);
-                    if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
-                    else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B output readback");
-
-                    // CPU hop: each captured output -> its own A-side upload ring slot
-                    uint64_t off2 = 0;
-                    for (int i = 0; i < nOut && h->rbB; ++i) {
-                        if (!outSwapped[i]) continue;
-                        ID3D12Resource* srcB = (ID3D12Resource*)outputs[i]->resource;
-                        D3D12_RESOURCE_DESC d = srcB->GetDesc();
-                        bool isBuf = (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
-                        uint64_t need = 0;
-                        UINT mips = 1;
-                        if (isBuf) need = d.Width;
-                        else {
-                            mips = d.MipLevels ? d.MipLevels : 1;
-                            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
-                            if (mips <= 16) {
-                                Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
-                                for (UINT k = 0; k < mips; ++k) need += slice[k];
-                            } else continue;
-                        }
-
-                        D3D12_RANGE r{off2, off2 + (SIZE_T)need};
-                        void* mRb = nullptr;
-                        if (FAILED(h->rbB->Map(0, &r, &mRb))) { XLog("ERROR: rbB map failed"); continue; }
-                        int slotIdx = h->outNext % XGPU_OUT_SLOTS;
-                        OutSlot* os = &h->outSlots[slotIdx];
-                        if (!os->upA || os->size < need) {
-                            if (os->upA) { os->upA->Release(); os->upA = nullptr; }
-                            uint64_t sz = need < (1u << 20) ? (1u << 20) : need;
-                            HRESULT hr2 = MakeBuffer(h->devA, D3D12_HEAP_TYPE_UPLOAD, sz,
-                                                     D3D12_RESOURCE_STATE_GENERIC_READ, &os->upA);
-                            if (FAILED(hr2)) { XLog("ERROR: out-slot upload create 0x%08X", (unsigned)hr2); h->rbB->Unmap(0, nullptr); continue; }
-                            os->size = sz;
-                        }
-                        void* mUpA = nullptr;
-                        if (FAILED(os->upA->Map(0, nullptr, &mUpA))) { XLog("ERROR: out-slot upload map failed"); h->rbB->Unmap(0, nullptr); continue; }
-                        memcpy(mUpA, mRb, need);
-                        os->upA->Unmap(0, nullptr);
-                        upAUsed[i] = os->upA;
-                        h->outNext++;
-                        h->rbB->Unmap(0, nullptr);
-                        off2 += need;
-                    }
+                    mips = d.MipLevels ? d.MipLevels : 1;
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
+                    if (mips <= 16) {
+                        Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
+                        for (UINT k = 0; k < mips; ++k) need += slice[k];
+                    } else continue;
                 }
+
+                D3D12_RANGE r{off2, off2 + (SIZE_T)need};
+                void* mRb = nullptr;
+                if (FAILED(h->rbB->Map(0, &r, &mRb))) { XLog("ERROR: rbB map failed"); continue; }
+                int slotIdx = h->outNext % XGPU_OUT_SLOTS;
+                OutSlot* os = &h->outSlots[slotIdx];
+                if (!os->upA || os->size < need) {
+                    if (os->upA) { os->upA->Release(); os->upA = nullptr; }
+                    uint64_t sz = need < (1u << 20) ? (1u << 20) : need;
+                    HRESULT hr2 = MakeBuffer(h->devA, D3D12_HEAP_TYPE_UPLOAD, sz,
+                                             D3D12_RESOURCE_STATE_GENERIC_READ, &os->upA);
+                    if (FAILED(hr2)) { XLog("ERROR: out-slot upload create 0x%08X", (unsigned)hr2); h->rbB->Unmap(0, nullptr); continue; }
+                    os->size = sz;
+                }
+                void* mUpA = nullptr;
+                if (FAILED(os->upA->Map(0, nullptr, &mUpA))) { XLog("ERROR: out-slot upload map failed"); h->rbB->Unmap(0, nullptr); continue; }
+                memcpy(mUpA, mRb, need);
+                os->upA->Unmap(0, nullptr);
+                upAUsed[i] = os->upA;
+                h->outNext++;
+                h->rbB->Unmap(0, nullptr);
+                off2 += need;
             }
         }
     }
 
-    // ---- record the copy-backs into the GAME's command list (still open — mid-recording) ----
+    // ---- output copy-backs: execute on OUR OWN GPU-A queue (NOT appended to the game's open list) ----
+    // Why not the game's list (the old design): appending CopyTextureRegion + barriers into a list
+    // the engine is mid-recording crashes Cyberpunk deterministically after the first GENERATE —
+    // our transitions desync from the engine's own state tracking of those textures. Doing it on
+    // our own clA/qA and waiting synchronously means: (1) we never touch the game's list, (2) by
+    // the time ffxDispatch returns (and the game executes its list), every output is already
+    // populated and restored to its declared state — completion of a fence is globally visible on
+    // the device, so no cross-queue sync object is needed.
     int anyCopied = 0, anySwapped = 0;
     for (int i = 0; i < nOut; ++i) {
         if (!outSwapped[i]) continue;
         anySwapped++;
-        if (upAUsed[i] && origCmdList) { xgpuRecordOutputCopyBack(h, origCmdList, &origOuts[i], upAUsed[i]); anyCopied++; }
+        // DIAGNOSTIC: log each output's real desc + the state the game declared.
+        {
+            ID3D12Resource* gt = (ID3D12Resource*)origOuts[i].resource;
+            if (gt) {
+                D3D12_RESOURCE_DESC d = gt->GetDesc();
+                XLog("copyback out[%d]: dim=%u %ux%ux%u fmt=0x%x mips=%u declaredState=0x%x", i,
+                     (unsigned)d.Dimension, d.Width, d.Height, d.DepthOrArraySize,
+                     (unsigned)d.Format, d.MipLevels, (unsigned)origOuts[i].state);
+            }
+        }
+    }
+    int haveAnyCapture = 0;
+    for (int i = 0; i < nOut; ++i) if (outSwapped[i] && upAUsed[i]) { haveAnyCapture = 1; break; }
+    if (haveAnyCapture) {
+        if (!SafeReset(h->clA, h->allocA, &g_resetWarnedA)) goto restore;   // poisoned list — abort
+        for (int i = 0; i < nOut; ++i) {
+            if (!outSwapped[i]) continue;
+            if (upAUsed[i]) { xgpuRecordOutputCopyBack(h, h->clA, &origOuts[i], upAUsed[i]); anyCopied++; }
+        }
+        if (FAILED(h->clA->Close())) XLog("ERROR: clA close (copyback) failed");
+        else {
+            ID3D12CommandList* lists[] = { h->clA };
+            h->qA->ExecuteCommandLists(1, lists);
+            h->fenceValA++;
+            h->qA->Signal(h->fenceA, h->fenceValA);
+            if (FAILED(h->fenceA->SetEventOnCompletion(h->fenceValA, h->evA))) XLog("ERROR: fence A event (copyback)");
+            else if (WaitForSingleObject(h->evA, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-A copyback");
+            {
+                HRESULT rmA = h->devA->GetDeviceRemovedReason();
+                if (rmA != S_OK) XLog("ERROR: devA REMOVED after qA copyback reason=0x%08X", (unsigned)rmA);
+            }
+        }
     }
     if (anySwapped > anyCopied)
         XLog("WARNING: %d/%d output captures failed — game's output textures hold stale data this frame",
@@ -875,11 +974,49 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
              totalMs, h->msTotalEma, h->msTotalMax);
     }
 
+    // ---- publish live stats to the HUD (g_upperscaleStats) — success path only ----
+    UpperscaleStats* st = &g_upperscaleStats;
+    InterlockedExchange((volatile LONG*)&st->mirrorCount, h->mirrorCount);
+
+    // Per-phase EMAs for the HUD (same alpha as the log stats).
+    st->msInputsEma     = (h->dispatches == 1) ? (t1 - t0) : st->msInputsEma * 0.9 + (t1 - t0) * 0.1;
+    st->msFfxRecordEma  = (h->dispatches == 1) ? (t2 - t1) : st->msFfxRecordEma * 0.9 + (t2 - t1) * 0.1;
+    st->msCaptureEma    = (h->dispatches == 1) ? (t3 - t2) : st->msCaptureEma * 0.9 + (t3 - t2) * 0.1;
+    st->msTotalEma      = h->msTotalEma;
+
+    // Frame time: wall-clock interval between "anchor" dispatches — upscale and FG-PREPARE run
+    // once per rendered frame, so their spacing IS the game's frame period (FG-GENERATE runs
+    // between frames and is deliberately not an anchor). Ignore gaps > 2 s (menu/loading).
+    bool isAnchor = (nodeType == FFX_API_DISPATCH_DESC_TYPE_UPSCALE ||
+                     nodeType == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK ||
+                     nodeType == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2 ||
+                     nodeType == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE);
+    if (isAnchor) {
+        double now = t3;
+        if (h->lastAnchorMs > 0.0) {
+            double dt = now - h->lastAnchorMs;
+            if (dt > 1.0 && dt < 2000.0) {   // sane frame period window
+                st->frameMsEma = (st->frameMsEma <= 0.05) ? dt : st->frameMsEma * 0.9 + dt * 0.1;
+                if (dt < st->frameMsMin || st->frameMsMin <= 0.0) st->frameMsMin = dt;
+                if (dt > st->frameMsMax) st->frameMsMax = dt;
+            }
+        }
+        h->lastAnchorMs = now;
+    }
+
 restore:
     // restore the desc exactly as the game passed it (per field, only what we swapped)
     for (int i = 0; i < nIn; ++i) if (wasSwapped[i]) inputs[i]->resource = origByField[i].resource;
     *pCmdList = origCmdList;
     for (int i = 0; i < nOut; ++i) if (outSwapped[i]) outputs[i]->resource = origOuts[i].resource;
+
+    // ---- HUD counters on EVERY intercepted dispatch (success or abort — this is the render path) ----
+    {
+        UpperscaleStats* st = &g_upperscaleStats;
+        InterlockedIncrement(&st->dispatches);
+        if (rc != FFX_API_RETURN_OK) InterlockedIncrement(&st->errors);
+        InterlockedExchange(&st->lastRc, (LONG)rc);
+    }
 
     return rc;
 }
