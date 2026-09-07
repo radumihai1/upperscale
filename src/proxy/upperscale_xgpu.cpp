@@ -95,11 +95,14 @@ static void XLog(const char* fmt, ...) {
     }
     int level = (g_cfgLogLevel > envOverride) ? g_cfgLogLevel : envOverride;
     if (level < 2) return;
-    FILE* f = fopen("upperscale.log", "a");
-    if (!f) return;
+    // Single long-lived FILE* (lazy open, append mode). The old per-line fopen/fclose cost a
+    // syscall pair on every log line in the render path. Flush after each write so the file is
+    // always complete even if the process dies mid-frame.
+    static FILE* f = nullptr;
+    if (!f) { f = fopen("upperscale.log", "a"); if (!f) return; }
     fprintf(f, "[xgpu] ");
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
-    fputc('\n', f); fclose(f);
+    fputc('\n', f); fflush(f);
 }
 
 static double NowMs() {
@@ -141,7 +144,9 @@ static D3D12_RESOURCE_STATES FfxStateToD3d(uint32_t s) {
         case 0x14:  return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                                   D3D12_RESOURCE_STATE_COPY_SOURCE);           // GENERIC_READ
-        case 0x80:  return D3D12_RESOURCE_STATE_RENDER_TARGET;             // PRESENT (backbuffer pre-Present)
+        case 0x80:  return (D3D12_RESOURCE_STATES)0;                       // PRESENT — D3D12's real value is 0.
+                                                                  // NOT RENDER_TARGET: a backbuffer in PRESENT state must be transitioned
+                                                                  // FROM PRESENT(0), and claiming RT would skip the driver's real fence.
         case 0x100: return D3D12_RESOURCE_STATE_RENDER_TARGET;             // RENDER_TARGET
         case 0x200: return D3D12_RESOURCE_STATE_DEPTH_WRITE;               // DEPTH_ATTACHMENT
         default:    return D3D12_RESOURCE_STATE_COMMON;                    // safe for 0/unknown (incl. INDIRECT_ARGUMENT)
@@ -198,9 +203,16 @@ static bool IsDepthFamilyFormat(DXGI_FORMAT f) {
 
 static HRESULT MakeBuffer(ID3D12Device* dev, D3D12_HEAP_TYPE ht, uint64_t bytes,
                           D3D12_RESOURCE_STATES st, ID3D12Resource** out) {
+    // Committed buffers are limited to UINT_MAX (4 GB). The old code silently clamped larger
+    // requests — a silent clamp means the caller's offsets run past the real buffer size and
+    // corrupt memory. Fail loudly instead; callers log + abort the dispatch.
+    if (bytes > 0xFFFFFFFFull) {
+        XLog("ERROR: MakeBuffer requested %llu bytes (>4GB committed limit) — refusing to allocate", (unsigned long long)bytes);
+        return E_INVALIDARG;
+    }
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = (UINT)(bytes > 0xFFFFFFFFull ? 0xFFFFFFFFu : bytes); // committed max 4GB
+    bd.Width = (UINT)bytes;
     bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
     bd.Format = DXGI_FORMAT_UNKNOWN; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     bd.SampleDesc.Count = 1;   // REQUIRED on this driver (zero-init gives Count=0)
@@ -236,7 +248,7 @@ static void Footprints(ID3D12Device* dev, const D3D12_RESOURCE_DESC* d, UINT mip
 // Verified with tools/xgpu_probe15_reset_efail.cpp (instrumented probe4 replica). So: never treat that
 // specific failure as fatal; log it once per list instead. ANY OTHER Reset failure means the list is
 // poisoned (e.g. a prior Close() failed) — recording into it is undefined behavior, so bail out.
-static int g_resetWarnedA = 0, g_resetWarnedB = 0;
+static int g_resetWarnedA = 0, g_resetWarnedB = 0, g_resetWarnedB2 = 0;
 static bool SafeReset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* alloc, int* warned) {
     HRESULT hr = cl->Reset(alloc, nullptr);
     if (SUCCEEDED(hr)) return true;
@@ -294,8 +306,10 @@ fail:
     if (h->fenceB) h->fenceB->Release();
     if (h->clA) h->clA->Release();
     if (h->clB) h->clB->Release();
+    if (h->clB2) h->clB2->Release();
     if (h->allocA) h->allocA->Release();
     if (h->allocB) h->allocB->Release();
+    if (h->allocB2) h->allocB2->Release();
     if (h->qA) h->qA->Release();
     if (h->qB) h->qB->Release();
     h->devA->Release();
@@ -316,8 +330,10 @@ void xgpuReleaseHub(XGpuHub* h) {
     if (h->fenceB) h->fenceB->Release();
     if (h->clA) h->clA->Release();
     if (h->clB) h->clB->Release();
+    if (h->clB2) h->clB2->Release();
     if (h->allocA) h->allocA->Release();
     if (h->allocB) h->allocB->Release();
+    if (h->allocB2) h->allocB2->Release();
     if (h->qA) h->qA->Release();
     if (h->qB) h->qB->Release();
     h->devA->Release();
@@ -773,7 +789,9 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     if (rc != FFX_API_RETURN_OK) { XLog("real ffxDispatch failed rc=%u", rc); goto restore; }
 
     // ---- E2: close + execute FFX's recorded list ALONE first, then check device health.
-    //      If devB is removed here the illegal command is inside FFX's own passes (not ours). ----
+    //      If devB is removed here the illegal command is inside FFX's own passes (not ours).
+    //      Our readback block runs on a SEPARATE list (clB2) only if devB survived — so an
+    //      "FFX-internal violation" vs "our readback commands" failure is cleanly separated in the log. ----
     if (FAILED(h->clB->Close())) XLog("ERROR: clB close (post-ffx) failed");
     else {
         ID3D12CommandList* lists[] = { h->clB };
@@ -788,8 +806,9 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
         if (rmB != S_OK) XLog("E2: devB REMOVED after FFX-ONLY list execute reason=0x%08X -> illegal command is inside FFX's recorded passes", (unsigned)rmB);
     }
 
-    // ---- record output readbacks on the SEPARATE clB2, execute it, then check again ----
+    // ---- output readbacks on the SEPARATE clB2, executed only if devB survived FFX's own passes ----
     ID3D12Resource* upAUsed[4] = {};   // A-side upload slot per swapped output (nullptr if not captured)
+    bool readbackDone = false;
     {
         uint64_t totalNeed = 0;
         for (int i = 0; i < nOut; ++i)
@@ -806,8 +825,10 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
                 }
             }
 
-        // ---- append output readbacks to the SAME open list FFX recorded into (only when there are outputs) ----
-        if (totalNeed > 0) {
+        bool devBHealthy = SUCCEEDED(h->devB->GetDeviceRemovedReason());
+        if (!devBHealthy) {
+            XLog("E2: skipping readback block — devB already removed by FFX's own passes");
+        } else if (totalNeed > 0 && SafeReset(h->clB2, h->allocB2, &g_resetWarnedB2)) {
             GrowBuffer(h, &h->rbB, &h->rbBSize, h->devB, D3D12_HEAP_TYPE_READBACK,
                        D3D12_RESOURCE_STATE_COPY_DEST, "B-readback", totalNeed);
             if (h->rbB) {
@@ -833,15 +854,15 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
 
                     if (isBuf) {
                         // FFX may have left the mirror in any state after its passes — transition from COMMON(0).
-                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                        h->clB->CopyBufferRegion(h->rbB, off, srcB, 0, d.Width);
-                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
+                        Barrier(h->clB2, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        h->clB2->CopyBufferRegion(h->rbB, off, srcB, 0, d.Width);
+                        Barrier(h->clB2, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
                     } else {
                         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]; UINT rows[16]; UINT64 pitch[16], slice[16];
                         Footprints(h->devB, &d, mips, fp, rows, pitch, slice);
                         // FFX may have left the mirror in any state after its passes — transition from COMMON(0)
                         // (this driver rejects ALL_BARRIERS and UAV barriers; verified xgpu_probe18 case g).
-                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        Barrier(h->clB2, srcB, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
                         for (UINT k = 0; k < mips; ++k) {
                             D3D12_TEXTURE_COPY_LOCATION dst{};
                             dst.pResource = h->rbB; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -854,36 +875,31 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
                             D3D12_TEXTURE_COPY_LOCATION src{};
                             src.pResource = srcB; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                             src.SubresourceIndex = k;
-                            h->clB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                            h->clB2->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                         }
-                        Barrier(h->clB, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
+                        Barrier(h->clB2, srcB, D3D12_RESOURCE_STATE_COPY_SOURCE, FfxStateToD3d(origOuts[i].state));
                     }
                     off += need;
+                }
+                if (FAILED(h->clB2->Close())) XLog("ERROR: clB2 close failed");
+                else {
+                    ID3D12CommandList* lists[] = { h->clB2 };
+                    h->qB->ExecuteCommandLists(1, lists);
+                    h->fenceValB++;
+                    h->qB->Signal(h->fenceB, h->fenceValB);
+                    if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
+                    else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B readback execute");
+                    {
+                        HRESULT rmB2 = h->devB->GetDeviceRemovedReason();
+                        if (rmB2 != S_OK) XLog("E2: devB REMOVED after READBACK list execute reason=0x%08X -> illegal command in our readback block", (unsigned)rmB2);
+                    }
+                    readbackDone = true;
                 }
             }
         }
 
-        // ---- ALWAYS close + execute clB after FFX returns, even when there are no outputs (PREPARE).
-        //      If we skip this for a 0-output dispatch the allocator stays "in use" and the NEXT
-        //      dispatch's Reset fails E_INVALIDARG -> poisoned list -> crash on frame 2. ----
-        {
-            HRESULT rmB = h->devB->GetDeviceRemovedReason();
-            if (rmB != S_OK) XLog("ERROR: devB REMOVED after ffxDispatch rc=%u reason=0x%08X - FFX recorded an illegal command", rc, (unsigned)rmB);
-        }
-        if (FAILED(h->clB->Close())) { XLog("ERROR: clB close (post-ffx) failed"); }
-        else {
-            ID3D12CommandList* lists[] = { h->clB };
-            h->qB->ExecuteCommandLists(1, lists);
-            h->fenceValB++;
-            h->qB->Signal(h->fenceB, h->fenceValB);
-            if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
-            else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B ffx execute");
-            {
-                HRESULT rmB2 = h->devB->GetDeviceRemovedReason();
-                if (rmB2 != S_OK) XLog("ERROR: devB REMOVED after qB execute reason=0x%08X - illegal command in our list", (unsigned)rmB2);
-            }
-
-            // CPU hop: each captured output -> its own A-side upload ring slot
+        // CPU hop: each captured output -> its own A-side upload ring slot
+        if (readbackDone) {
             uint64_t off2 = 0;
             for (int i = 0; i < nOut && h->rbB; ++i) {
                 if (!outSwapped[i]) continue;

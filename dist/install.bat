@@ -6,13 +6,15 @@ rem  a game folder with a reversible backup of the original DLL.
 rem
 rem  What it does:
 rem    1. locates the game's bin\x64 folder (Steam default, or ask)
-rem    2. backs up the ORIGINAL amd_fidelityfx_dx12.dll once
+rem    2. kills any running Cyberpunk processes and verifies they are gone
+rem       (open handles would make the copy fail mid-write)
+rem    3. backs up the ORIGINAL amd_fidelityfx_dx12.dll once
 rem       to upperscale_backup_amd_fidelityfx_dx12.dll
-rem    3. copies our proxy + the game's own original loader into that folder
+rem    4. copies our proxy + the game's own original loader into that folder
 rem       (the original loader becomes upperscale_real_loader.dll -- this is
 rem        critical: Cyberpunk ships a custom fat loader with embedded FFX
 rem        effect implementations; using a thin SDK stub instead breaks FSR4)
-rem    4. runs upperscale_config.exe to pick which GPU runs FFX
+rem    5. runs upperscale_config.exe to pick which GPU runs FFX
 rem
 rem  Undo everything: run uninstall.bat from this same folder.
 rem ============================================================
@@ -45,6 +47,20 @@ rem ---- verify our files are present ----------------------------------------
 if not exist "%SELF%\amd_fidelityfx_dx12.dll" goto missing_file
 if not exist "%SELF%\upperscale_config.exe" goto missing_file
 
+rem ---- kill running game processes and VERIFY they are gone -----------------
+rem (an open handle on the DLL makes copy /y fail or leave a torn file)
+set "KILL_TRIES=0"
+:kill_loop
+tasklist | findstr /i "Cyberpunk2077.exe REDprelauncher.exe" >nul || goto kill_done
+if %KILL_TRIES% GEQ 5 goto game_running
+echo Stopping running Cyberpunk processes...
+taskkill /f /im Cyberpunk2077.exe >nul 2>&1
+taskkill /f /im REDprelauncher.exe >nul 2>&1
+set /a KILL_TRIES+=1
+timeout /t 2 /nobreak >nul
+goto kill_loop
+:kill_done
+
 rem ---- back up the original loader exactly once ----------------------------
 set "BACKUP=%GAME%\upperscale_backup_amd_fidelityfx_dx12.dll"
 if exist "%BACKUP%" goto have_backup
@@ -69,7 +85,6 @@ goto stage_files
 
 rem ---- stage the proxy + the game's own original loader as backend ----------
 :stage_files
-tasklist | findstr /i "Cyberpunk2077.exe" >nul && goto game_running
 copy /y "%SELF%\amd_fidelityfx_dx12.dll" "%GAME%\amd_fidelityfx_dx12.dll" >nul || goto copy_fail
 
 rem The backend must be the game's OWN original loader (the fat custom DLL),
@@ -91,6 +106,7 @@ echo.
 echo === done ===
 echo Launch the game with FSR enabled. A small upperscale HUD appears top-left:
 echo   [Ins] show/hide HUD    [Del] cycle log level    [End] toggle ACTIVE/PASSTHROUGH live
+echo   [Home] toggle fg (FG on B vs native) -- takes effect next launch
 echo Log file: %GAME%\upperscale.log
 echo To remove everything later, run uninstall.bat from this folder.
 pause
@@ -110,7 +126,7 @@ pause & exit /b 1
 echo ERROR: no backup found and original was already replaced. Run Steam verify integrity, then retry.
 pause & exit /b 1
 :game_running
-echo WARNING: Cyberpunk2077.exe is running -- close it before installing.
+echo WARNING: a Cyberpunk process is still running after 5 stop attempts -- close it manually before installing.
 pause & exit /b 1
 :copy_fail
 echo ERROR: file copy failed (is the game folder read-only?)

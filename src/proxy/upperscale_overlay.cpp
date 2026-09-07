@@ -73,7 +73,8 @@ static void RenderPanel(HWND hwnd, int w, int h) {
                  s->msInputsEma, s->msFfxRecordEma, s->msCaptureEma, s->msTotalEma);
         TextOutA(dcMem, 10, y, line, (int)strlen(line)); y += 17;
 
-        snprintf(line, sizeof(line), "mirrors %ld | log level %d", s->mirrorCount, (int)s->logLevel);
+        snprintf(line, sizeof(line), "mirrors %ld | log level %d | fg=%s",
+                 s->mirrorCount, (int)s->logLevel, s->fgOnB ? "1 (FG on B)" : "0 (FG native)");
         TextOutA(dcMem, 10, y, line, (int)strlen(line)); y += 19;
     } else {
         SetTextColor(dcMem, RGB(150, 155, 170));
@@ -82,7 +83,7 @@ static void RenderPanel(HWND hwnd, int w, int h) {
     }
 
     SetTextColor(dcMem, RGB(120, 125, 145));
-    const char* help = "[Ins] show/hide   [Del] log level   [End] active/passthrough";
+    const char* help = "[Ins] hide   [Del] log   [End] mode   [Home] fg";
     TextOutA(dcMem, 10, y, help, (int)strlen(help));
 
     POINT ptZero{0, 0};
@@ -117,12 +118,16 @@ static LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (wp == 3) {   // End — toggle mode live
                 upperscaleSetMode(g_upperscaleStats.mode ? 0 : 1);
                 InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (wp == 4) {   // Home — toggle fg=0/1 (persisted; effective next launch)
+                upperscaleSetFgOnB(g_upperscaleStats.fgOnB ? 0 : 1);
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
         case WM_DESTROY:
             UnregisterHotKey(hwnd, 1);
             UnregisterHotKey(hwnd, 2);
             UnregisterHotKey(hwnd, 3);
+            UnregisterHotKey(hwnd, 4);
             PostQuitMessage(0);
             return 0;
     }
@@ -146,7 +151,7 @@ static DWORD WINAPI HudThread(LPVOID) {
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              FIXED_PITCH | FF_MODERN, "Consolas");
 
-    const int W = 470, H = 128;
+    const int W = 470, H = 142;
     g_hud = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, kHudClass, L"upperscale",
                             WS_POPUP, 24, 64, W, H, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hud) return 0;
@@ -156,6 +161,7 @@ static DWORD WINAPI HudThread(LPVOID) {
     RegisterHotKey(g_hud, 1, MOD_NOREPEAT, VK_INSERT);
     RegisterHotKey(g_hud, 2, MOD_NOREPEAT, VK_DELETE);
     RegisterHotKey(g_hud, 3, MOD_NOREPEAT, VK_END);
+    RegisterHotKey(g_hud, 4, MOD_NOREPEAT, VK_HOME);
     SetTimer(g_hud, 1, 250, nullptr);
 
     MSG m;

@@ -97,9 +97,10 @@ Hotkeys work while the game has focus:
 | `Insert` | show / hide the HUD |
 | `Delete` | cycle log level 0→1→2→3 (also persisted to ini) |
 | `End` | toggle ACTIVE ↔ PASSTHROUGH live (no restart; also persisted to ini) |
+| `Home` | toggle fg=0/1 — FG native on A vs FG on B (persisted to ini; takes effect for contexts created after the next game launch, since games create their FFX contexts at startup) |
 
 Notes:
-- The HUD is a topmost GDI window. In **exclusive fullscreen** the game covers it — use **borderless/windowed mode** to see it (same limitation as most OSDs). Stats are always in `upperscale.log` regardless.
+- The HUD is a topmost GDI window. In **exclusive fullscreen** the game covers it — use **borderless/windowed mode** to see it (same limitation as most OSDs). Stats are always in `upperscale.log` regardless; treat the log as the source of truth when the HUD is covered.
 - Toggling to PASSTHROUGH live is the fastest way to A/B-test "is the proxy causing this?" without restarting.
 
 ## Manual install (other games)
@@ -124,10 +125,20 @@ enable=1                 ; 1 = ACTIVE (cross-GPU), 0 = PASSTHROUGH (forward unto
 gpu_luid_low=0x27214     ; low 32 bits of the target GPU LUID
 gpu_luid_high=0x0        ; high 32 bits (usually 0)
 log=2                    ; 0 off, 1 create/destroy, 2 verbose, 3 per-dispatch
-fg=1                     ; 1 = frame generation also on GPU B; 0 = FG stays native on A
-                         ;            (safe fallback: only upscaling goes cross-GPU)
+fg=0                     ; DEFAULT: frame generation stays native on GPU A; only upscaling goes
+                         ;            cross-GPU. Set fg=1 to run FG on GPU B too — EXPERIMENTAL:
+                         ;            in Cyberpunk 2077 this removes GPU B after the first generated
+                         ;            frame (FFX holds the game's swapchain from ffxConfigure and its
+                         ;            GENERATE passes reference it cross-adapter; see HANDOFF §4).
 ```
 Env vars are read first and then **overridden by the ini if present**: `UPPERSCALE_ENABLE`, `UPPERSCALE_GPU_LUID` (+`_HI`), `UPPERSCALE_REAL_LOADER`, `UPPERSCALE_LOG`, `UPPERSCALE_FG`.
+
+> **Why is fg=0 the default?** In Cyberpunk 2077, FFX's frame-generation passes reference the
+> game's swapchain (passed to `ffxConfigure`) while executing on GPU B — a cross-adapter violation
+> that removes device B after the first generated frame. Verified in-game with isolated execution
+> (FFX's recorded list alone kills devB; our readback commands never run). With `fg=0` the FG
+> contexts keep their native GPU-A device and are forwarded untouched, so Cyberpunk runs its stock
+> FSR4+FG pipeline on the render card while any standalone upscaling still offloads to GPU B.
 
 ## Testing (no game required)
 
@@ -149,6 +160,7 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
   2. *Proxy reported version 0.0.0.0.* Cyberpunk gates FSR4/FG on the loader's file version, not just its API behavior — a proxy with no version resource hid FSR4 even when forwarding every call verbatim (verified: all `ffxQuery` rc=0, zero swaps, FSR4 still gone). The build now embeds the stock loader's exact version metadata (`1.0.1.41314`, "AMD FidelityFX").
 - **Log says `mode=PASSTHROUGH`** — ini not found in CWD or LUID wrong; run `upperscale_config.exe list`.
 - **`ffxDispatch: intercepted ... rc=1`** — see the `[xgpu] ERROR:` lines above it in the log (input bounce / mirror creation failures are logged with details).
+- **Game crashes / GPU B removed after enabling `fg=1` in Cyberpunk** — known and expected: FFX's FG passes reference the game's swapchain cross-adapter (verified root cause, see HANDOFF §4). Use the default `fg=0`: upscaling still runs on GPU B, frame generation stays native on the render card.
 - **Game crashes on FFX dispatch** — make sure the game's FFX textures have `ALLOW_UNORDERED_ACCESS` (all real games do; if you're testing a custom harness, set it — see HANDOFF quirk #7).
 - **First frame is slow (~1 s)** — expected: FFX compiles its shaders on first dispatch.
 - **Garbage/black frames right after enabling FG** — the engine calls `ffxDispatch` while its command list is still open (single-submit), so our synchronous bounce reads *last* executed frame's inputs (+1 frame latency). The first generated frames can be garbage until temporal history settles; in menus there are no motion vectors at all, so FG output there is meaningless.
@@ -157,13 +169,17 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
 ## Status
 
 - ✅ Cross-GPU upscale (FSR4) — verified end-to-end with output parity vs single-GPU control
-- ✅ Cross-GPU frame generation (PREPARE_V2 + FRAMEGENERATION, up to 4 outputs) — verified in synthetic tests; Cyberpunk validation ongoing
-- ✅ Config tool (`upperscale_config.exe`) + ini/env config
-- ✅ Installer/uninstaller with original-DLL backup (`dist/`)
-- ✅ Debug HUD: frame times (EMA/min/max), per-phase dispatch stats, live mode/log toggles
-- ✅ Passthrough transparency: stock version metadata + game's own loader as backend (FSR4 detection fix)
-- ⏳ Cyberpunk ACTIVE-mode stability in real gameplay (crash after first FG frames under investigation; `fg=0` safe fallback available)
-- ⏳ Async pipelining of the RAM bounce (task 6b); presentation-takeover design to skip copy-backs entirely
+- ✅ Passthrough transparency: stock version metadata + game's own loader as backend (FSR4 detection fix); 16+ min in-game, zero errors
+- ✅ **Safe mode `fg=0` (default)** — FG-family contexts stay native on GPU A and are forwarded untouched; only upscaling goes cross-GPU. Wired end-to-end (create gate + per-context dispatch gate), synthetic tests PASS both fg values
+- ⛔ Cross-GPU frame generation in Cyberpunk 2077 (`fg=1`) — **root-caused, disabled by default**: FFX holds the game's swapchain from `ffxConfigure` and its GENERATE passes reference it while executing on GPU B → device removed (0x887A0006). Proven in-game with isolated execution: FFX's recorded list alone removes devB before any of our readback commands run. Fixing requires a presentation-takeover design (own swapchain on GPU B) — tracked as future work
+- ✅ Config tool (`upperscale_config.exe`) + ini/env config, `--fg` option, target-device validation
+- ✅ Installer/uninstaller with original-DLL backup, process kill+verify before staging, restore identity check (`dist/`)
+- ✅ Debug HUD: frame times (EMA/min/max), per-phase dispatch stats, live mode/log/fg toggles (Insert/Delete/End/Home)
+- ⏳ Async pipelining of the RAM bounce; presentation-takeover design to skip copy-backs and unlock FG-on-B
+
+## Versioning
+
+`v0.9.x` — safe-mode release line: cross-GPU upscaling stable, FG-on-B disabled by default for Cyberpunk (root cause documented). `v1.0.0` is reserved for when FG-on-B works in-game or the presentation-takeover design lands.
 
 ## License
 

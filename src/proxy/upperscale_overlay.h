@@ -6,6 +6,8 @@
 //   Insert  — show/hide the HUD
 //   Delete  — cycle log level 0 -> 1 -> 2 -> 3 (persisted to upperscale.ini)
 //   End     — toggle ACTIVE <-> PASSTHROUGH live (persisted to upperscale.ini)
+//   Home    — toggle fg=0/1: frame generation on GPU B vs native on A (persisted; takes effect for
+//             contexts created after the next game launch)
 //
 // All stats are plain volatile fields written by the render thread and read by the HUD timer.
 // Torn reads of a double are harmless for a debug display; counters use Interlocked ops.
@@ -17,6 +19,7 @@ struct UpperscaleStats {
     // --- mode / config (written at load + on live toggle) ---
     volatile LONG   mode;          // 0 = passthrough, 1 = active
     volatile LONG   logLevel;      // current effective log level
+    volatile LONG   fgOnB;         // 1 = FG also on GPU B (experimental), 0 = FG native on A (default)
     ULONG           luidLo, luidHi;// target GPU LUID from config
     char            gpuBName[64];  // resolved adapter name ("" until the device is created)
 
@@ -52,3 +55,4 @@ void upperscaleOverlayStart(int enabled);
 // g_upperscaleStats, and persists the change to upperscale.ini so it survives a restart.
 int upperscaleSetMode(int enable);      // 1 = active, 0 = passthrough; returns new mode
 int upperscaleSetLogLevel(int level);   // 0..3; returns new level
+int upperscaleSetFgOnB(int on);         // 1 = FG on GPU B (experimental), 0 = FG native on A; returns new value

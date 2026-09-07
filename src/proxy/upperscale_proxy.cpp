@@ -72,11 +72,11 @@ struct Config {
 static Config          g_cfg{};
 // Exposed to upperscale_xgpu.cpp so its [xgpu] diagnostics honor the ini/env log level in-game.
 int g_cfgLogLevel = 0;
-// fg=1 (default): frame generation also runs on GPU B (full cross-GPU). fg=0: FG stays native on
-// the main GPU A and is forwarded untouched — only upscaling goes cross-GPU. This is the SAFE mode:
-// Cyberpunk's FG presentColor input is a swapchain backbuffer in PRESENT state, and mirroring +
-// copy-back'ing it across GPUs crashes deterministically after ~2 frames on this driver (task 7b).
-int g_cfgFgOnB = 1;
+// fg=1: frame generation also runs on GPU B (full cross-GPU, EXPERIMENTAL — Cyberpunk's FG-on-B
+// path removes device B after the first GENERATE dispatch). fg=0 (default): FG stays native on the
+// main GPU A and its dispatches are forwarded untouched — only upscaling goes cross-GPU. Wired in
+// v10: ffxCreateContext skips the device swap for FG-family contexts, ffxDispatch forwards them.
+int g_cfgFgOnB = 0;
 static CRITICAL_SECTION g_cs;
 static int             g_csInit = 0;
 static HINSTANCE       g_hInst = nullptr;
@@ -97,16 +97,19 @@ UpperscaleStats g_upperscaleStats{};   // zero-initialized at load time
 static void LogAlways(const char* fmt, ...);   // fwd — defined below with the other logging helpers
 
 // Persist a single key=value line into upperscale.ini in CWD (create if missing). Used by the
-// live hotkey toggles so a mode/log change survives a game restart. Best-effort: never blocks or
-// fails the render path — on any error we just skip persistence.
+// live hotkey toggles so a mode/log/fg change survives a game restart. Best-effort: never blocks
+// or fails the render path — on any error we just skip persistence.
+// Section-aware: only replaces keys inside [proxy]; every other section, comment and line is
+// preserved verbatim. Writes to a temp file first and atomically renames over the ini so a crash
+// mid-write can never corrupt it.
 static void IniSetKey(const char* key, const char* value) {
     char dir[MAX_PATH] = {};
     if (!GetCurrentDirectoryA(sizeof(dir), dir)) return;
     char iniPath[MAX_PATH * 2] = {};
     snprintf(iniPath, sizeof(iniPath), "%s\\upperscale.ini", dir);
 
-    // Read existing lines (keep everything except the key we're replacing). If no ini exists yet,
-    // buf stays empty and we create a fresh [proxy] section below.
+    // Read existing lines (keep everything except the key we're replacing inside [proxy]). If no
+    // ini exists yet, buf stays empty and a fresh [proxy] section is created below.
     FILE* f = fopen(iniPath, "r");
     char buf[8192] = {};
     size_t n = 0;
@@ -117,23 +120,40 @@ static void IniSetKey(const char* key, const char* value) {
 
     char out[16384] = {};
     size_t o = 0;
-    int inProxy = (strstr(buf, "[proxy]") != nullptr);
-    if (!inProxy) { snprintf(out + o, sizeof(out) - o, "[proxy]\n"); o += strlen(out + o); }
+    int inProxy = 0;      // current section while scanning
+    int replaced = 0;     // did we drop the old occurrence of our key?
+    int sawProxySection = (strstr(buf, "[proxy]") != nullptr);
 
     char* savep = nullptr;
     for (char* line = strtok_s(buf, "\r\n", &savep); line; line = strtok_s(nullptr, "\r\n", &savep)) {
-        // skip the old occurrence of our key inside [proxy]
-        if (!strnicmp(line, key, strlen(key)) && line[strlen(key)] == '=') continue;
+        // section header? (first non-whitespace char is '[') — else: maybe the key we're replacing.
+        {
+            char* p = line; while (*p == ' ' || *p == '\t') ++p;
+            if (*p == '[') {
+                inProxy = (!stricmp(p, "[proxy]"));
+            } else if (inProxy && !replaced && !strnicmp(p, key, strlen(key)) && p[strlen(key)] == '=') {
+                replaced = 1;   // skip the old occurrence of our key inside [proxy] — new one appended below
+                continue;
+            }
+        }
         snprintf(out + o, sizeof(out) - o, "%s\n", line);
         o += strlen(out + o);
     }
-    // append (or create) the new key=value at the end of [proxy]
-    snprintf(out + o, sizeof(out) - o, "%s=%s\n", key, value);
 
-    FILE* w = fopen(iniPath, "w");
+    if (!replaced) {
+        // append (or create) the key at the end of [proxy] — open a new section if none existed.
+        if (!sawProxySection) { snprintf(out + o, sizeof(out) - o, "[proxy]\n"); o += strlen(out + o); }
+        snprintf(out + o, sizeof(out) - o, "%s=%s\n", key, value);
+    }
+
+    // Atomic replace: write temp file in the same directory, then rename over the target.
+    char tmpPath[MAX_PATH * 2] = {};
+    snprintf(tmpPath, sizeof(tmpPath), "%s\\upperscale.ini.tmp", dir);
+    FILE* w = fopen(tmpPath, "w");
     if (!w) return;
     fputs(out, w);
     fclose(w);
+    MoveFileExA(tmpPath, iniPath, MOVEFILE_REPLACE_EXISTING);   // fails silently — best effort
 }
 
 // Live control API — called by the HUD hotkeys (and exportable for external tools).
@@ -161,8 +181,25 @@ int upperscaleSetLogLevel(int level) {
     return level;
 }
 
-// context bookkeeping for task 5: ffxContext -> original game device (GPU A) + transfer hub
-struct CtxInfo { ffxContext ctx; ID3D12Device* origDev; XGpuHub* hub; };
+// Live FG toggle (Home hotkey). Affects contexts created AFTER the toggle — Cyberpunk creates its
+// FFX contexts at startup, so a live flip takes effect on next game launch. The ini write is what
+// makes it stick: LoadConfig reads fg= at attach time.
+int upperscaleSetFgOnB(int on) {
+    EnterCriticalSection(&g_cs);
+    g_cfg.fgOnB = on ? 1 : 0;
+    LeaveCriticalSection(&g_cs);
+    g_cfgFgOnB = g_cfg.fgOnB;   // published for the create/dispatch gates
+    InterlockedExchange((volatile LONG*)&g_upperscaleStats.fgOnB, g_cfg.fgOnB);
+    IniSetKey("fg", g_cfg.fgOnB ? "1" : "0");
+    LogAlways("LIVE: fg -> %d (persisted to upperscale.ini; takes effect for contexts created after restart)", g_cfg.fgOnB);
+    return g_cfg.fgOnB;
+}
+
+// context bookkeeping for task 5: ffxContext -> original game device (GPU A) + transfer hub.
+// swapped=1: backend device was replaced with GPU B at create time — dispatches MUST be routed
+// through the cross-GPU intercept. swapped=0: FG-family context kept native on GPU A because of
+// fg=0 (safe mode) — its dispatches are forwarded untouched to the real loader.
+struct CtxInfo { ffxContext ctx; ID3D12Device* origDev; XGpuHub* hub; int swapped; int nativeLogged; };
 #define MAX_TRACKED_CTX 64
 static CtxInfo g_ctxTable[MAX_TRACKED_CTX];      // small fixed table, no heap in render path
 
@@ -199,8 +236,11 @@ static void LoadConfig() {
     g_cfg.luidHi = 0;
     g_cfg.luidLo = 0;
     g_cfg.logLevel = 1;
-    g_cfg.fgOnB = 1;   // fg=0 (safe fallback): FG stays native on GPU A, only upscaling goes cross-GPU.
-                       // Cyberpunk's FSR4 pipeline is entirely FG-family contexts, so fg=0 ≈ passthrough there.
+    // fg default is 0 (SAFE MODE) as of v10: Cyberpunk's FG-on-B path removes GPU B after the first
+    // GENERATE dispatch (see docs/HANDOFF.md §4). Until that is fixed, frame generation stays native
+    // on GPU A and only upscaling goes cross-GPU. Set fg=1 in upperscale.ini to opt into full
+    // cross-GPU FG (experimental — known crash in Cyberpunk 2077).
+    g_cfg.fgOnB = 0;
     g_cfg.realLoaderPath[0] = 0;
 
     char buf[64] = {};
@@ -348,9 +388,9 @@ static int SwapBackendDevice(ffxApiHeader* head, ID3D12Device** origOut) {
 }
 
 // ---- Context table helpers (advisory; task 5 keys on ffxContext properly) ----
-static void CtxTrack(ffxContext ctx, ID3D12Device* orig) {
+static void CtxTrack(ffxContext ctx, ID3D12Device* orig, int swapped) {
     for (int i = 0; i < MAX_TRACKED_CTX; ++i)
-        if (!g_ctxTable[i].ctx && ctx) { g_ctxTable[i].ctx = ctx; g_ctxTable[i].origDev = orig; g_ctxTable[i].hub = nullptr; return; }
+        if (!g_ctxTable[i].ctx && ctx) { g_ctxTable[i].ctx = ctx; g_ctxTable[i].origDev = orig; g_ctxTable[i].hub = nullptr; g_ctxTable[i].swapped = swapped; return; }
 }
 static void CtxUntrack(ffxContext ctx) {
     for (int i = 0; i < MAX_TRACKED_CTX; ++i)
@@ -382,13 +422,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         // publish config into the live stats block (HUD reads it) and start the debug HUD thread.
         g_upperscaleStats.mode = g_cfg.enable ? 1 : 0;
         g_upperscaleStats.logLevel = g_cfg.logLevel;
+        g_upperscaleStats.fgOnB = g_cfg.fgOnB;
         g_upperscaleStats.luidLo = g_cfg.luidLo;
         g_upperscaleStats.luidHi = g_cfg.luidHi;
         upperscaleOverlayStart(1);   // always available — Insert hides it (debug tool)
         if (g_cfg.logLevel > 0) {
             g_log = fopen(g_logPath, "a");
-            LogAlways("=== upperscale proxy loaded v9 === mode=%s luid={%lx,%lx} log=%d",
-                      g_cfg.enable ? "ACTIVE" : "PASSTHROUGH", g_cfg.luidHi, g_cfg.luidLo, g_cfg.logLevel);
+            LogAlways("=== upperscale proxy loaded v10 === mode=%s luid={%lx,%lx} log=%d fg=%d",
+                      g_cfg.enable ? "ACTIVE" : "PASSTHROUGH", g_cfg.luidHi, g_cfg.luidLo, g_cfg.logLevel, g_cfg.fgOnB);
         }
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_log) { fclose(g_log); g_log = nullptr; }
@@ -402,15 +443,32 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 // ---- The 5 exported FFX entry points (signatures match AMD's ABI exactly — see ffx_api.h) ----
 extern "C" {
 
+// FG-family effect check: the top-level create desc type encodes backend|effect|subversion.
+// Effect ids (ffx_api.h): UPSCALE 0x1xxxx, FRAMEGENERATION 0x2xxxx, FGSWAPCHAIN 0x3xxxx,
+// FGSWAPCHAIN_VK 0x4xxxx — i.e. effect bytes 0x2/0x3/0x4 are all frame-generation family.
+static int IsFgFamilyContextType(uint64_t topType) {
+    uint32_t eff = (uint32_t)(topType & 0x00ff0000ull);   // FFX_API_EFFECT_MASK
+    return (eff == 0x00020000u || eff == 0x00030000u || eff == 0x00040000u);
+}
+
 ffxReturnCode_t __declspec(dllexport) ffxCreateContext(ffxContext* context, ffxApiHeader* desc, const void* memCb) {
     if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    // fg=0 (safe mode): FG-family contexts keep the game's GPU-A device — no swap. Their dispatches
+    // are then forwarded untouched (see ffxDispatch). Only upscaling goes cross-GPU. Cyberpunk's
+    // whole FSR4 pipeline is FG-family, so fg=0 ≈ passthrough there; standalone upscale contexts
+    // still offload to GPU B.
+    int skipSwap = 0;
+    if (g_cfg.enable && !g_cfgFgOnB && IsFgFamilyContextType(desc->type)) {
+        skipSwap = 1;
+        LogAlways("fg=0: FG-family context topType=0x%llx kept native on GPU A (no device swap)", (unsigned long long)desc->type);
+    }
     ID3D12Device* origDev = nullptr;
-    int swapped = SwapBackendDevice(desc, &origDev);   // no-op in passthrough mode
+    int swapped = skipSwap ? 0 : SwapBackendDevice(desc, &origDev);   // no-op in passthrough mode
     if (g_cfg.logLevel >= 2) Log("ffxCreateContext topType=0x%llx swapped=%d", (unsigned long long)desc->type, swapped);
     if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
     ffxReturnCode_t rc = g_pRealCreate(context, desc, memCb);   // memCb is an opaque const void* (ffxAllocationCallbacks*)
     LogAlways("ffxCreateContext: topType=0x%llx rc=%u swapped=%d ctx=%p", (unsigned long long)desc->type, rc, swapped, context ? *context : nullptr);
-    if (rc == FFX_API_RETURN_OK && swapped) CtxTrack(*context, origDev);
+    if (rc == FFX_API_RETURN_OK && g_cfg.enable) CtxTrack(*context, origDev, swapped);   // track unswapped FG ctxs too (dispatch gate keys on it)
     return rc;
 }
 
@@ -426,10 +484,13 @@ ffxReturnCode_t __declspec(dllexport) ffxDestroyContext(ffxContext* context, con
 
 ffxReturnCode_t __declspec(dllexport) ffxConfigure(ffxContext* context, const ffxApiHeader* desc) {
     if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
-    // E1 diagnostic: for FG configure (type 0x20002), log the swapchain + callback pointers.
-    // Layout per ffx_framegeneration.h: header(16B), swapChain@16, presentCallback@24,
-    // presentCallbackUserContext@32, frameGenerationCallback@40, fgCallbackUserContext@48.
-    if (g_cfg.logLevel >= 2 && desc->type == 0x20002ull) {
+    // E1 diagnostic (UNCONDITIONAL — one-shot at startup, must fire even at log=1): for FG configure
+    // (type 0x20002), log the swapchain + callback pointers. If Cyberpunk passes a non-null
+    // swapChain and FFX references it during GENERATE dispatch on GPU B, that is the cross-adapter
+    // violation removing device B (hypothesis A). Layout per ffx_framegeneration.h: header(16B),
+    // swapChain@16, presentCallback@24, presentCallbackUserContext@32, frameGenerationCallback@40,
+    // fgCallbackUserContext@48.
+    if (desc->type == 0x20002ull) {
         const uint8_t* p = (const uint8_t*)desc;
         LogAlways("E1: ffxConfigure FG ctx=%p swapChain=%p presentCallback=%p pcUserCtx=%p fgCallback=%p fgUserCtx=%p pNext=%p",
                   context, *(const void**)(p + 16), *(const void**)(p + 24), *(const void**)(p + 32),
@@ -465,8 +526,16 @@ ffxReturnCode_t __declspec(dllexport) ffxDispatch(ffxContext* context, const ffx
     // unrecognized dispatch types are refused (ERROR_PARAMETER) — forwarding them would mix GPU-A
     // resources with the GPU-B-bound context (undefined behavior).
     if (g_cfg.enable && g_swapsDone > 0) {
-        if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;   // need g_pRealDispatch for the intercept
         CtxInfo* ci = CtxFind(*context);
+        // fg=0 gate: this context was created WITHOUT a device swap (FG-family kept native on GPU A).
+        // Its dispatches must be forwarded untouched — bouncing them would mix GPU-A resources with a
+        // GPU-B-bound context. One log line per such context, then quiet.
+        if (ci && !ci->swapped) {
+            if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
+            if (!ci->nativeLogged) { ci->nativeLogged = 1; LogAlways("ffxDispatch: ctx=%p is native-on-A (fg=0) — forwarding untouched", *context); }
+            return g_pRealDispatch(context, desc);
+        }
+        if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;   // need g_pRealDispatch for the intercept
         ID3D12Device* origDev = ci ? ci->origDev : nullptr;
         // Fallback: no tracked context (e.g. query-only flow) — cannot bounce without the game device.
         if (!origDev) {
