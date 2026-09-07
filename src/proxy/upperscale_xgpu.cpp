@@ -270,6 +270,10 @@ XGpuHub* xgpuGetOrCreateHub(ID3D12Device* devA, ID3D12Device* devB) {
     hr = devA->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h->allocA, nullptr, IID_PPV_ARGS(&h->clA));
     if (SUCCEEDED(hr)) hr = devB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h->allocB, nullptr, IID_PPV_ARGS(&h->clB));
     if (FAILED(hr)) goto fail;
+    // E2 diagnostic: second B list so FFX's recorded passes and our readbacks execute SEPARATELY.
+    hr = devB->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&h->allocB2));
+    if (SUCCEEDED(hr)) hr = devB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h->allocB2, nullptr, IID_PPV_ARGS(&h->clB2));
+    if (FAILED(hr)) goto fail;
     hr = devA->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h->fenceA));
     if (SUCCEEDED(hr)) hr = devB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h->fenceB));
     if (FAILED(hr)) goto fail;
@@ -768,7 +772,23 @@ ffxReturnCode_t xgpuInterceptDispatch(XGpuHub* h, void* ctx, const void* descIn,
     double t2 = NowMs();
     if (rc != FFX_API_RETURN_OK) { XLog("real ffxDispatch failed rc=%u", rc); goto restore; }
 
-    // ---- append output readbacks to the SAME open list FFX recorded into, execute on B ----
+    // ---- E2: close + execute FFX's recorded list ALONE first, then check device health.
+    //      If devB is removed here the illegal command is inside FFX's own passes (not ours). ----
+    if (FAILED(h->clB->Close())) XLog("ERROR: clB close (post-ffx) failed");
+    else {
+        ID3D12CommandList* lists[] = { h->clB };
+        h->qB->ExecuteCommandLists(1, lists);
+        h->fenceValB++;
+        h->qB->Signal(h->fenceB, h->fenceValB);
+        if (FAILED(h->fenceB->SetEventOnCompletion(h->fenceValB, h->evB))) XLog("ERROR: fence B event");
+        else if (WaitForSingleObject(h->evB, 30000) != WAIT_OBJECT_0) XLog("ERROR: timeout waiting GPU-B ffx execute");
+    }
+    {
+        HRESULT rmB = h->devB->GetDeviceRemovedReason();
+        if (rmB != S_OK) XLog("E2: devB REMOVED after FFX-ONLY list execute reason=0x%08X -> illegal command is inside FFX's recorded passes", (unsigned)rmB);
+    }
+
+    // ---- record output readbacks on the SEPARATE clB2, execute it, then check again ----
     ID3D12Resource* upAUsed[4] = {};   // A-side upload slot per swapped output (nullptr if not captured)
     {
         uint64_t totalNeed = 0;

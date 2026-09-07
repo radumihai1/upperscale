@@ -426,6 +426,15 @@ ffxReturnCode_t __declspec(dllexport) ffxDestroyContext(ffxContext* context, con
 
 ffxReturnCode_t __declspec(dllexport) ffxConfigure(ffxContext* context, const ffxApiHeader* desc) {
     if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    // E1 diagnostic: for FG configure (type 0x20002), log the swapchain + callback pointers.
+    // Layout per ffx_framegeneration.h: header(16B), swapChain@16, presentCallback@24,
+    // presentCallbackUserContext@32, frameGenerationCallback@40, fgCallbackUserContext@48.
+    if (g_cfg.logLevel >= 2 && desc->type == 0x20002ull) {
+        const uint8_t* p = (const uint8_t*)desc;
+        LogAlways("E1: ffxConfigure FG ctx=%p swapChain=%p presentCallback=%p pcUserCtx=%p fgCallback=%p fgUserCtx=%p pNext=%p",
+                  context, *(const void**)(p + 16), *(const void**)(p + 24), *(const void**)(p + 32),
+                  *(const void**)(p + 40), *(const void**)(p + 48), desc->pNext);
+    }
     // configure descs (global debug etc.) carry no device — nothing to swap.
     if (g_cfg.logLevel >= 2) Log("ffxConfigure ctx=%p type=0x%llx", context, (unsigned long long)desc->type);
     if (!EnsureRealLoader()) return FFX_API_RETURN_ERROR;
