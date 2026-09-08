@@ -164,8 +164,13 @@ static int CmdSet(int argc, char** argv) {
     printf("Wrote %s\n", path);
     printf("  GPU B (FFX target): [%d] %s  LUID low=0x%lx high=0x%lx\n", idx, a[idx].name, a[idx].luidLo, a[idx].luidHi);
     printf("  enable=%d log=%d fg=%d%s\n", enable, logLevel, fgOnB, fgOnB ? " (EXPERIMENTAL: FG on B)" : "");
-    printf("\nNext: drop amd_fidelityfx_dx12.dll + upperscale_real_loader.dll into the same folder,\n");
-    printf("then launch the game with FSR enabled. Check <game-dir>\\upperscale.log for 'mode=ACTIVE'.\n");
+    printf("\nNext:\n");
+    printf("  Easiest: run install.bat from this folder -- it stages the proxy AND creates\n");
+    printf("  upperscale_real_loader.dll (a copy of the game's own original loader) for you.\n");
+    printf("  Manual: drop amd_fidelityfx_dx12.dll into <game-dir>\\bin\\x64, and put a copy of\n");
+    printf("  that game's ORIGINAL amd_fidelityfx_dx12.dll there as upperscale_real_loader.dll\n");
+    printf("  (Cyberpunk ships a custom fat loader; the thin SDK stub breaks FSR4).\n");
+    printf("Then launch the game with FSR enabled. Check <game-dir>\\upperscale.log for 'mode=ACTIVE'.\n");
     return 0;
 }
 
