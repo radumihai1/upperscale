@@ -54,26 +54,25 @@ The version resource (`upperscale_version.rc`) is **required**: it makes the pro
 
 ## Using it (installer)
 
-The `dist/` folder is a self-contained package — copy it anywhere and run `install.bat`:
+The `dist/` folder is a self-contained package — copy it anywhere:
 
 ```
 dist\
-  install.bat              <- double-click to install
-  uninstall.bat            <- double-click to remove everything again
+  upperscale_installer.exe <- GUI installer (recommended): pick GPU, install / update LUID / uninstall
+  install.bat              <- same steps, command-line version
+  uninstall.bat            <- remove everything again
   amd_fidelityfx_dx12.dll  <- the proxy (replaces AMD's loader)
-  upperscale_config.exe    <- GPU picker / ini writer
+  upperscale_config.exe    <- headless GPU picker / ini writer
 ```
 
-**Install:**
-1. Close the game if it's running.
-2. Double-click `install.bat`. It will:
-   - locate the game folder (Steam default paths, or ask you for the path),
-   - **back up the original `amd_fidelityfx_dx12.dll` once** to `upperscale_backup_amd_fidelityfx_dx12.dll`,
-   - stage our proxy + the game's own original loader as `upperscale_real_loader.dll` (the backend — this must be the game's fat custom loader, not a thin SDK stub; see Troubleshooting),
-   - run the GPU picker: it lists your adapters and writes `upperscale.ini` with the LUID of the adapter you choose. **Pick the card that does NOT render the game** (the one your monitor is plugged into).
-3. Launch the game with FSR enabled. A small HUD appears top-left (see below); details go to `<game-dir>\upperscale.log`.
+**Install (GUI):** double-click `upperscale_installer.exe`. It shows your D3D12 adapters with VRAM + LUID, a live status line for the game folder, and three actions:
+- **INSTALL** — kills+verifies any running game process, backs up the original `amd_fidelityfx_dx12.dll` once to `upperscale_backup_amd_fidelityfx_dx12.dll`, stages our proxy + the game's own original loader as `upperscale_real_loader.dll` (the backend — this must be the game's fat custom loader, not a thin SDK stub; see Troubleshooting), and writes `upperscale.ini` for the selected GPU. **Pick the card that does NOT render the game** (the one your monitor is plugged into).
+- **UPDATE GPU / LUID** — if already installed: re-pick the adapter and it rewrites only the LUID in `upperscale.ini`, preserving enable/log/fg settings. Use this after a reboot or driver change, because **Windows reassigns adapter LUIDs on reboot** — an old LUID silently puts you back in passthrough mode (the HUD will say `gpuB=(not created)`).
+- **UNINSTALL** — verifies the current DLL is ours (MD5), restores the original loader from backup with a byte-identity check, and removes all upperscale files.
 
-**Uninstall:** double-click `uninstall.bat` from the same folder. It verifies the current DLL is ours, restores the original loader from the backup, and removes all upperscale files (`upperscale.ini`, `upperscale.log`, staged copies). Steam "verify integrity of game files" also works as a last resort.
+The same three operations work headless: `upperscale_installer.exe install|update|uninstall <game-dir> [gpuIndex] [fg]`.
+
+**Install (bat):** double-click `install.bat` — identical steps to the GUI's INSTALL, with prompts instead of a window.
 
 ## Debug HUD (OptiScaler-style overlay)
 
@@ -155,10 +154,12 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
 
 ## Troubleshooting
 
-- **FSR4 missing from the upscaler list** — two known causes, both fixed in current builds:
+- **FSR4 missing from the upscaler list** — known causes:
   1. *Backend was a thin SDK stub.* Cyberpunk ships its own custom ~6 MB loader with embedded FFX effect implementations; forwarding to a 26 KB SDK stub makes provider lookups fail and FSR4 disappears (even in passthrough). The installer now stages the game's **own original loader** as `upperscale_real_loader.dll`.
   2. *Proxy reported version 0.0.0.0.* Cyberpunk gates FSR4/FG on the loader's file version, not just its API behavior — a proxy with no version resource hid FSR4 even when forwarding every call verbatim (verified: all `ffxQuery` rc=0, zero swaps, FSR4 still gone). The build now embeds the stock loader's exact version metadata (`1.0.1.41314`, "AMD FidelityFX").
-- **Log says `mode=PASSTHROUGH`** — ini not found in CWD or LUID wrong; run `upperscale_config.exe list`.
+  3. ***Still missing with current builds — under investigation.*** With (1) and (2) fixed, our proxy returns **byte-identical** `GET_VERSIONS` results to stock and every in-game query returns rc=0, yet Cyberpunk still hides FSR4 from settings on both GPUs/LUIDs. The gate is therefore a file-level property of the DLL itself, not its API behavior. Leading hypothesis: an Authenticode check (stock loader = signed by AMD `Valid`; our proxy = unsigned). No AMD-specific signature-verification string was found in any game binary (all `WinVerifyTrust` imports belong to NVIDIA Streamline), so this is unconfirmed — see HANDOFF §"FSR4 visibility".
+- **Log says `mode=PASSTHROUGH`** — ini not found in CWD or LUID wrong; run `upperscale_config.exe list`. Note: **Windows reassigns adapter LUIDs on reboot**, so a previously-written ini can silently point at the wrong (or no) adapter after a restart. Re-run the installer's UPDATE step (or `upperscale_config.exe set`) to refresh the LUID.
+- **HUD says `gpuB=(not created)`** — same root cause: the configured GPU-B LUID no longer matches any live adapter (reboot/driver change). Update the LUID via the GUI installer or config tool; the HUD updates on next launch.
 - **`ffxDispatch: intercepted ... rc=1`** — see the `[xgpu] ERROR:` lines above it in the log (input bounce / mirror creation failures are logged with details).
 - **Game crashes / GPU B removed after enabling `fg=1` in Cyberpunk** — known and expected: FFX's FG passes reference the game's swapchain cross-adapter (verified root cause, see HANDOFF §4). Use the default `fg=0`: upscaling still runs on GPU B, frame generation stays native on the render card.
 - **Game crashes on FFX dispatch** — make sure the game's FFX textures have `ALLOW_UNORDERED_ACCESS` (all real games do; if you're testing a custom harness, set it — see HANDOFF quirk #7).
@@ -169,10 +170,11 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
 ## Status
 
 - ✅ Cross-GPU upscale (FSR4) — verified end-to-end with output parity vs single-GPU control
-- ✅ Passthrough transparency: stock version metadata + game's own loader as backend (FSR4 detection fix); 16+ min in-game, zero errors
+- ✅ Passthrough transparency: stock version metadata + game's own loader as backend; 16+ min in-game, zero errors. **Open:** FSR4 still absent from Cyberpunk settings menu with current builds despite byte-identical feature-detection responses — file-level gate suspected (Authenticode), under investigation
 - ✅ **Safe mode `fg=0` (default)** — FG-family contexts stay native on GPU A and are forwarded untouched; only upscaling goes cross-GPU. Wired end-to-end (create gate + per-context dispatch gate), synthetic tests PASS both fg values
 - ⛔ Cross-GPU frame generation in Cyberpunk 2077 (`fg=1`) — **root-caused, disabled by default**: FFX holds the game's swapchain from `ffxConfigure` and its GENERATE passes reference it while executing on GPU B → device removed (0x887A0006). Proven in-game with isolated execution: FFX's recorded list alone removes devB before any of our readback commands run. Fixing requires a presentation-takeover design (own swapchain on GPU B) — tracked as future work
 - ✅ Config tool (`upperscale_config.exe`) + ini/env config, `--fg` option, target-device validation
+- ✅ **GUI installer** (`upperscale_installer.exe`, single native Win32 exe): pick GPU → INSTALL / UPDATE LUID (post-reboot) / UNINSTALL; MD5 identity checks on backup+restore; headless CLI mode for the same ops. Verified end-to-end against a fake game dir
 - ✅ Installer/uninstaller with original-DLL backup, process kill+verify before staging, restore identity check (`dist/`)
 - ✅ Debug HUD: frame times (EMA/min/max), per-phase dispatch stats, live mode/log/fg toggles (Insert/Delete/End/Home)
 - ⏳ Async pipelining of the RAM bounce; presentation-takeover design to skip copy-backs and unlock FG-on-B

@@ -1,31 +1,38 @@
-# upperscale — HANDOFF (updated 2026-09-07, v10)
+# upperscale — HANDOFF (updated 2026-09-09)
 
 Cross-GPU FSR4/frame-generation proxy for Cyberpunk 2077 on a dual-AMD box.
-GPU A = RX 7900 XTX (LUID low=0x2A089, high=0) — game rendering.
-GPU B = RX 9060 XT (LUID low=0x27214, high=0) — display output adapter; both monitors cabled here.
+GPU A = RX 7900 XTX — game rendering. LUIDs are REASSIGNED ON REBOOT: was low=0x2A089, now 0x59173 (high=0).
+GPU B = RX 9060 XT — display output adapter; both monitors cabled here. Was low=0x27214, now 0x5670A.
+NOTE: a SECOND "RX 9060 XT"-named adapter appeared after the reboot (LUID 0xF7470) — verify by name+VRAM, not index.
 
 This document is the single source of truth for resuming work. It separates VERIFIED facts from
 HYPOTHESES. Do not treat hypotheses as established. **The ACTIVE-mode FG crash that blocked v9 is
-now ROOT-CAUSED and worked around (fg=0 default). See §4.**
+now ROOT-CAUSED and worked around (fg=0 default). See §4.** **FSR4 visibility in the settings menu is
+REOPENED — see §3/§3b.**
 
 =====================================================================
-## 1. STATUS AT A GLANCE (v10)
+## 1. STATUS AT A GLANCE
 =====================================================================
-WORKS (verified in-game, this session):
+WORKS (verified in-game):
 - PASSTHROUGH mode with correct backend: stable 16+ min, thousands of ffxDispatch rc=0, zero errors.
-- FSR4 visible when the game's own loader is staged as backend (§3 root cause).
 - **fg=0 SAFE MODE (now the DEFAULT) in ACTIVE mode**: both FG-family contexts kept native on GPU A,
   every dispatch forwarded untouched, ZERO device swaps, ZERO [xgpu] intercepts, ZERO errors across
   ~95k FG GENERATE dispatches spanning a 10+ min menu session AND ~4 min of active gameplay (drove
   Space→Enter into the game). This is the shipping configuration for Cyberpunk.
-- Synthetic tests (ffx_dispatchtest, ffx_fgtest) PASS at BOTH fg=0 and fg=1 on build v10.
+- Synthetic tests (ffx_dispatchtest fg=0/1, ffx_fgtest fg=0) PASS on current build; test tools now resolve
+  GPU A by name (env override UPPERSCALE_GPUA_LO/HI) so they survive LUID reassignment across reboots.
 - Standalone HUD test PASSES; hotkeys: Insert=show/hide, Delete=cycle log level, End=toggle mode live,
   **Home=toggle fg** (all persisted to ini).
-- Installer/uninstaller scripts work end-to-end (tested via `cmd /c script.bat < input.txt`).
+- Installer/uninstaller scripts work end-to-end; NEW GUI installer (upperscale_installer.exe) verified
+  end-to-end against a fake game dir (install → update LUID → uninstall, stock restored byte-identical).
+
+OPEN BUG:
+- FSR4 still absent from Cyberpunk's Graphics settings menu with current builds, despite byte-identical
+  feature-detection responses and all queries rc=0. File-level gate suspected (Authenticode). §3b.
 
 SHIPPED AS DISABLED-BY-DEFAULT (root-caused, not a bug in our code):
 - ACTIVE mode with fg=1: GPU B device is REMOVED (0x887A0006) after the FIRST FRAMEGENERATION list.
-  Root cause proven this session (§4). Fixing requires a presentation-takeover design — future work.
+  Root cause proven (§4). Fixing requires a presentation-takeover design — future work.
 
 =====================================================================
 ## 2. VERIFIED FACTS (with evidence) vs HYPOTHESES
@@ -64,11 +71,52 @@ HYPOTHESES (NOT verified — do not build on these without evidence):
   (In fg=0 mode the game runs its own stock FG, so this is no longer our concern for Cyberpunk.)
 
 =====================================================================
-## 3. THE FSR4-DISAPPEARANCE FIX (done, verified)
+## 3. THE FSR4-DISAPPEARANCE (partially fixed — REOPENED 2026-09-08)
 =====================================================================
+Fixed and verified earlier:
 - dist/install.bat stages the GAME'S OWN original loader as upperscale_real_loader.dll (backed up to
   upperscale_backup_amd_fidelityfx_dx12.dll on first install; uninstall restores it). The thin SDK stub is
-  NOT part of the package. Verified in-game: passthrough + fg=0 runs clean, FSR4 present.
+  NOT part of the package.
+- Proxy embeds stock version metadata (1.0.1.41314, "AMD FidelityFX") — byte-identical resource to stock.
+
+REOPENED: with both fixes in place, user testing on 2026-09-08 shows FSR4 STILL absent from Cyberpunk's
+Graphics settings menu (both GPU A and B as target; HUD shows gpuB=(not created) when the LUID is stale).
+See §3b for the investigation state.
+
+=====================================================================
+## 3b. FSR4 VISIBILITY — INVESTIGATION STATE (2026-09-08/09)
+=====================================================================
+Established facts from in-game log + binary analysis:
+1. Our proxy's GET_VERSIONS (type=0x4, 8 calls at startup) returns BYTE-IDENTICAL results to stock when
+   both are loaded side-by-side via a standalone probe: UPSCALE 3.1.4/2.3.3, FRAMEGEN 1.1.3, FGSWAPCHAIN
+   1.1.3. Every in-game ffxQuery returns rc=0; swapped=0 on all (fg=0). Zero ffxCreateContext/Configure/
+   Dispatch for the FSR4 path — the game never even tries to create an FSR4 context after probing us.
+2. The gate is therefore a FILE-LEVEL property of amd_fidelityfx_dx12.dll, evaluated before/independent of
+   any FFX API call. It is NOT the LUID/target GPU (fails identically with both adapters).
+3. Version resource: byte-identical to stock (verified via dumpbin /resources + PowerShell FileVersionInfo).
+4. Authenticode: stock = Valid (signed by AMD); our proxy = NotSigned. This is the ONE remaining file-level
+   difference found so far → LEADING HYPOTHESIS.
+5. Counter-evidence against a simple WinVerifyTrust gate in native code: Cyberpunk2077.exe's WinVerifyTrust
+   import + "Streamline will not load unsecured modules" strings are NVIDIA/DLSS-specific (verified by string
+   context). No AMD-specific signature-verification strings found in any game binary. The check could still be
+   present without a distinctive string (e.g., via a generic helper, or inside Redscript/.rsc logic — .rsc
+   archives are packed; plain-text scan found no FSR4 strings but that is not conclusive).
+
+NEXT EXPERIMENTS (in order):
+a. Sign the proxy with a self-signed cert + import into user Root store → WinVerifyTrust reports Valid for
+   our chain. Stage in game dir, launch Cyberpunk, check if FSR4 appears in Graphics settings. If YES → root
+   cause confirmed; then evaluate whether ANY valid signature suffices or AMD's specific identity is required
+   (test with a different self-signed subject). Kill the game after each test.
+b. If (a) fails: instrument — hook WinVerifyTrust/WinVerifyTrustEx in our proxy DLL (it will be called for us
+   if the game verifies per-DLL) and log who calls it, with what flags; also try Get-AuthenticodeSignature on
+   other AMD FFX files to see if Cyberpunk checks a family of files.
+c. If still stuck: compare PE structure more deeply (section names/alignment, import table order, TLS,
+   delay-load) between stock and proxy — some games fingerprint the loader's PE layout.
+
+NOTE ON LUIDS: Windows reassigned ALL adapter LUIDs on the 2026-09-08 reboot (7900 XTX was 0x2A089, now
+0x59173; 9060 XT was 0x27214, now 0x5670A — and a SECOND 9060-XT-named adapter appeared at 0xF7470). Test
+tools now resolve GPU A by name with env override (UPPERSCALE_GPUA_LO/HI); the GUI installer's UPDATE step
+exists precisely for this.
 
 =====================================================================
 ## 4. ACTIVE-MODE FG CRASH — ROOT-CAUSED (this session)
@@ -169,11 +217,14 @@ Log check after ~90s: head -1 log (banner), grep -cE "REMOVED|ERROR", tail of lo
 =====================================================================
 ## 8. DELIVERABLES STATE (user's standing request)
 =====================================================================
-- Debug overlay with frame times + stats: DONE (built, unit-tested; Home hotkey added this session).
-- Self-contained installer folder dist/: install.bat + uninstall.bat + proxy DLL (v10) + config exe — scripts work.
-- README: updated with fg=0 default rationale, Home hotkey, troubleshooting entry for the FG-on-B crash, and a
-  Versioning section (v0.9.x safe-mode line; v1.0.0 reserved).
-- GitHub push: PENDING this session's final commit (post .gitignore + dist refresh).
+- Debug overlay with frame times + stats: DONE (built, unit-tested; Home hotkey added).
+- Self-contained installer folder dist/: upperscale_installer.exe (GUI) + install.bat + uninstall.bat +
+  proxy DLL + config exe — all verified end-to-end. GUI supports INSTALL / UPDATE LUID / UNINSTALL with
+  MD5 identity checks; headless CLI mode for the same ops.
+- README: updated with GUI installer as primary path, LUID-reboot pitfall (gpuB=(not created)), and the
+  REOPENED FSR4-visibility status (honest — not claimed fixed).
+- GitHub push: current commit ships the GUI installer + docs; next commit expected after §3b experiment (a)
+  resolves the FSR4 visibility question.
 
 User requirements to keep honoring: close the game after every test; document everything; put everything
 needed in one folder with usage docs; push to GitHub when done.

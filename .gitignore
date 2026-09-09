@@ -13,3 +13,6 @@ _input.txt
 _t_*.bat
 _test_*.bat
 _repro.bat
+
+# proxy runtime log (written to CWD when run from repo root)
+upperscale.log

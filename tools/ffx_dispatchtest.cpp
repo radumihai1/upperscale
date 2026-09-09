@@ -65,12 +65,37 @@ static void FfxMsg(uint32_t type, const wchar_t* msg) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    ULONG luidA_lo = 0x2A089u;   // 7900 XTX (game GPU)
+    // GPU A = the game's rendering card (7900 XTX). LUIDs are reassigned on reboot, so:
+    //   1) env UPPERSCALE_GPUA_LO / UPPERSCALE_GPUA_HI win if set;
+    //   2) else match by name "7900 XTX";
+    //   3) else fall back to the last-known LUID.
+    ULONG luidA_lo = 0x2A089u, luidA_hi = 0;
+    const char* envLo = getenv("UPPERSCALE_GPUA_LO");
+    if (envLo && *envLo) {
+        luidA_lo = (ULONG)strtoul(envLo, nullptr, 16);
+        const char* envHi = getenv("UPPERSCALE_GPUA_HI");
+        if (envHi && *envHi) luidA_hi = (ULONG)strtoul(envHi, nullptr, 16);
+    } else {
+        IDXGIFactory1* f = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) {
+            for (UINT i = 0; ; ++i) {
+                IDXGIAdapter1* a = nullptr;
+                if (FAILED(f->EnumAdapters1(i, &a))) break;
+                DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d);
+                char nameA[512]{};
+                WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, nameA, sizeof(nameA), nullptr, nullptr);
+                if (strstr(nameA, "7900 XTX")) { luidA_lo = d.AdapterLuid.LowPart; luidA_hi = d.AdapterLuid.HighPart; a->Release(); f->Release(); f = nullptr; printf("resolved GPU A by name: %s LUID=0x%lx\n", nameA, luidA_lo); break; }
+                a->Release();
+            }
+            if (f) f->Release();
+        }
+    }
+
+    ID3D12Device* devA = CreateDeviceByLuid(luidA_hi, luidA_lo);
+    if (!devA) { printf("FAIL: no GPU A device\n"); return 1; }
+
     const char* saveFile = "out.bin";
     if (argc > 2) saveFile = argv[2];
-
-    ID3D12Device* devA = CreateDeviceByLuid(0, luidA_lo);
-    if (!devA) { printf("FAIL: no GPU A device\n"); return 1; }
 
     // ---- load OUR proxy DLL (must sit next to this exe in build/smoke/) ----
     HMODULE hProxy = LoadLibraryA("amd_fidelityfx_dx12.dll");   // resolved from EXE dir first
