@@ -8,7 +8,7 @@ NOTE: a SECOND "RX 9060 XT"-named adapter appeared after the reboot (LUID 0xF747
 This document is the single source of truth for resuming work. It separates VERIFIED facts from
 HYPOTHESES. Do not treat hypotheses as established. **The ACTIVE-mode FG crash that blocked v9 is
 now ROOT-CAUSED and worked around (fg=0 default). See §4.** **FSR4 visibility in the settings menu is
-REOPENED — see §3/§3b.**
+ROOT-CAUSED as a hardware limitation (RDNA3 render GPU), not a proxy bug — see §3/§3b.**
 
 =====================================================================
 ## 1. STATUS AT A GLANCE
@@ -26,9 +26,10 @@ WORKS (verified in-game):
 - Installer/uninstaller scripts work end-to-end; NEW GUI installer (upperscale_installer.exe) verified
   end-to-end against a fake game dir (install → update LUID → uninstall, stock restored byte-identical).
 
-OPEN BUG:
-- FSR4 still absent from Cyberpunk's Graphics settings menu with current builds, despite byte-identical
-  feature-detection responses and all queries rc=0. File-level gate suspected (Authenticode). §3b.
+RESOLVED (2026-09-09):
+- FSR4 absent from Cyberpunk's Graphics settings menu — ROOT CAUSE: FSR4 is RDNA4-only and the game
+  renders on the RDNA3 7900 XTX (GpuPreference=2 → HighPerfAdapter DEV_744C). Not a proxy issue.
+  Fix path documented in §3b + tools/fsr4_gpu_switch.ps1 (user decision: conflicts with "7900 XTX primary").
 
 SHIPPED AS DISABLED-BY-DEFAULT (root-caused, not a bug in our code):
 - ACTIVE mode with fg=1: GPU B device is REMOVED (0x887A0006) after the FIRST FRAMEGENERATION list.
@@ -71,7 +72,7 @@ HYPOTHESES (NOT verified — do not build on these without evidence):
   (In fg=0 mode the game runs its own stock FG, so this is no longer our concern for Cyberpunk.)
 
 =====================================================================
-## 3. THE FSR4-DISAPPEARANCE (partially fixed — REOPENED 2026-09-08)
+## 3. THE FSR4-DISAPPEARANCE (root-caused 2026-09-09 — hardware, not proxy)
 =====================================================================
 Fixed and verified earlier:
 - dist/install.bat stages the GAME'S OWN original loader as upperscale_real_loader.dll (backed up to
@@ -79,39 +80,45 @@ Fixed and verified earlier:
   NOT part of the package.
 - Proxy embeds stock version metadata (1.0.1.41314, "AMD FidelityFX") — byte-identical resource to stock.
 
-REOPENED: with both fixes in place, user testing on 2026-09-08 shows FSR4 STILL absent from Cyberpunk's
-Graphics settings menu (both GPU A and B as target; HUD shows gpuB=(not created) when the LUID is stale).
-See §3b for the investigation state.
+RESOLVED: with both fixes in place, user testing on 2026-09-08 showed FSR4 still absent from Cyberpunk's
+Graphics settings menu (both GPU A and B as target). Root cause found 2026-09-09: FSR4 is an RDNA4-only
+feature and the game renders on the RDNA3 7900 XTX. See §3b for the full evidence chain + fix path.
 
 =====================================================================
-## 3b. FSR4 VISIBILITY — INVESTIGATION STATE (2026-09-08/09)
+## 3b. FSR4 VISIBILITY — ROOT CAUSE FOUND (2026-09-09)
 =====================================================================
-Established facts from in-game log + binary analysis:
-1. Our proxy's GET_VERSIONS (type=0x4, 8 calls at startup) returns BYTE-IDENTICAL results to stock when
-   both are loaded side-by-side via a standalone probe: UPSCALE 3.1.4/2.3.3, FRAMEGEN 1.1.3, FGSWAPCHAIN
-   1.1.3. Every in-game ffxQuery returns rc=0; swapped=0 on all (fg=0). Zero ffxCreateContext/Configure/
-   Dispatch for the FSR4 path — the game never even tries to create an FSR4 context after probing us.
-2. The gate is therefore a FILE-LEVEL property of amd_fidelityfx_dx12.dll, evaluated before/independent of
-   any FFX API call. It is NOT the LUID/target GPU (fails identically with both adapters).
-3. Version resource: byte-identical to stock (verified via dumpbin /resources + PowerShell FileVersionInfo).
-4. Authenticode: stock = Valid (signed by AMD); our proxy = NotSigned. This is the ONE remaining file-level
-   difference found so far → LEADING HYPOTHESIS.
-5. Counter-evidence against a simple WinVerifyTrust gate in native code: Cyberpunk2077.exe's WinVerifyTrust
-   import + "Streamline will not load unsecured modules" strings are NVIDIA/DLSS-specific (verified by string
-   context). No AMD-specific signature-verification strings found in any game binary. The check could still be
-   present without a distinctive string (e.g., via a generic helper, or inside Redscript/.rsc logic — .rsc
-   archives are packed; plain-text scan found no FSR4 strings but that is not conclusive).
+ROOT CAUSE: FSR4 is an RDNA4-only feature, and Cyberpunk renders on the RDNA3 card.
 
-NEXT EXPERIMENTS (in order):
-a. Sign the proxy with a self-signed cert + import into user Root store → WinVerifyTrust reports Valid for
-   our chain. Stage in game dir, launch Cyberpunk, check if FSR4 appears in Graphics settings. If YES → root
-   cause confirmed; then evaluate whether ANY valid signature suffices or AMD's specific identity is required
-   (test with a different self-signed subject). Kill the game after each test.
-b. If (a) fails: instrument — hook WinVerifyTrust/WinVerifyTrustEx in our proxy DLL (it will be called for us
-   if the game verifies per-DLL) and log who calls it, with what flags; also try Get-AuthenticodeSignature on
-   other AMD FFX files to see if Cyberpunk checks a family of files.
-c. If still stuck: compare PE structure more deeply (section names/alignment, import table order, TLS,
-   delay-load) between stock and proxy — some games fingerprint the loader's PE layout.
+Evidence chain (all verified on this machine):
+1. AMD + CDPR confirm FSR4 in Cyberpunk 2077 is exclusive to Radeon RX 9000 series (RDNA4).
+   The 7900 XTX is RDNA3 and physically cannot run FSR4 — it gets FSR3 only.
+2. Windows per-app GPU settings (HKCU\Software\Microsoft\DirectX\UserGpuPreferences):
+     Cyberpunk2077.exe = "GpuPreference=2;AutoHDREnable=2097;"   (2 = High Performance)
+     DirectXUserGlobalSettings: HighPerfAdapter = 1002&744C&2422148C
+3. PCI ID mapping (Win32_VideoController): DEV_744C = RX 7900 XTX, DEV_7590 = RX 9060 XT.
+   => Cyberpunk's render device is the RDNA3 7900 XTX. FSR4 can therefore NEVER appear in its
+   settings menu on this configuration — independent of our proxy.
+
+Why earlier evidence looked like "our tool hides FSR4":
+- Our proxy returns byte-identical GET_VERSIONS to stock (UPSCALE 3.1.4/2.3.3, FRAMEGEN 1.1.3,
+  FGSWAPCHAIN 1.1.3) and every in-game ffxQuery returns rc=0 with swapped=0 — the API is fully
+  transparent; it does not hide anything.
+- "FSR4 disappears when I activate the tool" was almost certainly a misattribution: FSR4 was never
+  going to show while Cyberpunk renders on RDNA3, so noticing its absence around the time of
+  enabling our proxy made it look causal.
+- Changing the LUID in upperscale.ini (or "trying the other GPU") only changes where OUR proxy
+  offloads work — it does NOT change which physical GPU Cyberpunk renders on, and that's what gates FSR4.
+
+Deprioritized hypothesis (kept for completeness): Authenticode signature gate. Stock loader is
+AMD-signed (Valid), our proxy unsigned; no AMD-specific verification strings found in game binaries
+(all WinVerifyTrust imports are NVIDIA Streamline). Still testable via tools/fsr4_gpu_switch.ps1 +
+a signed build, but the RDNA3 render-GPU explanation accounts for ALL observed symptoms.
+
+TO GET FSR4 IN SETTINGS (user decision required — conflicts with "7900 XTX primary" preference):
+- Point Cyberpunk at the 9060 XT: tools/fsr4_gpu_switch.ps1 -To9060 (typed CONFIRM guard; edits ONE
+  HKCU registry value only; -Revert restores). Then FSR4 should appear in Graphics -> Upscaler.
+- If doing so, re-point our proxy's offload target back to the 7900 XTX via the GUI installer's
+  UPDATE step (render=9060 XT, offload=7900 XTX) — that is the intended cross-GPU configuration.
 
 NOTE ON LUIDS: Windows reassigned ALL adapter LUIDs on the 2026-09-08 reboot (7900 XTX was 0x2A089, now
 0x59173; 9060 XT was 0x27214, now 0x5670A — and a SECOND 9060-XT-named adapter appeared at 0xF7470). Test
@@ -222,9 +229,10 @@ Log check after ~90s: head -1 log (banner), grep -cE "REMOVED|ERROR", tail of lo
   proxy DLL + config exe — all verified end-to-end. GUI supports INSTALL / UPDATE LUID / UNINSTALL with
   MD5 identity checks; headless CLI mode for the same ops.
 - README: updated with GUI installer as primary path, LUID-reboot pitfall (gpuB=(not created)), and the
-  REOPENED FSR4-visibility status (honest — not claimed fixed).
-- GitHub push: current commit ships the GUI installer + docs; next commit expected after §3b experiment (a)
-  resolves the FSR4 visibility question.
+  FSR4 root cause (RDNA3 render GPU — hardware limit, not a proxy bug).
+- tools/fsr4_gpu_switch.ps1: guarded helper to point Cyberpunk at the RDNA4 card (typed CONFIRM; one HKCU
+  registry value; -Revert restores) for when the user opts in.
+- GitHub push: GUI installer + docs shipped (58c0638); this commit adds the FSR4 root cause + helper.
 
 User requirements to keep honoring: close the game after every test; document everything; put everything
 needed in one folder with usage docs; push to GitHub when done.

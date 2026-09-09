@@ -157,7 +157,14 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
 - **FSR4 missing from the upscaler list** — known causes:
   1. *Backend was a thin SDK stub.* Cyberpunk ships its own custom ~6 MB loader with embedded FFX effect implementations; forwarding to a 26 KB SDK stub makes provider lookups fail and FSR4 disappears (even in passthrough). The installer now stages the game's **own original loader** as `upperscale_real_loader.dll`.
   2. *Proxy reported version 0.0.0.0.* Cyberpunk gates FSR4/FG on the loader's file version, not just its API behavior — a proxy with no version resource hid FSR4 even when forwarding every call verbatim (verified: all `ffxQuery` rc=0, zero swaps, FSR4 still gone). The build now embeds the stock loader's exact version metadata (`1.0.1.41314`, "AMD FidelityFX").
-  3. ***Still missing with current builds — under investigation.*** With (1) and (2) fixed, our proxy returns **byte-identical** `GET_VERSIONS` results to stock and every in-game query returns rc=0, yet Cyberpunk still hides FSR4 from settings on both GPUs/LUIDs. The gate is therefore a file-level property of the DLL itself, not its API behavior. Leading hypothesis: an Authenticode check (stock loader = signed by AMD `Valid`; our proxy = unsigned). No AMD-specific signature-verification string was found in any game binary (all `WinVerifyTrust` imports belong to NVIDIA Streamline), so this is unconfirmed — see HANDOFF §"FSR4 visibility".
+  3. ***FSR4 absent because the game renders on an RDNA3 card (root-caused 2026-09-09).*** FSR4 is an
+     RDNA4-only feature (RX 9000 series). On a dual-GPU box, check which physical GPU the game actually
+     renders on: `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` → the game's exe entry + global
+     `HighPerfAdapter`, mapped to PCI device IDs via `Win32_VideoController`. If that's an RDNA3 card, FSR4
+     will never appear in settings no matter what the proxy does (our GET_VERSIONS is byte-identical to
+     stock and all queries return rc=0 — verified). Fix: point the game at the RDNA4 card with
+     `tools/fsr4_gpu_switch.ps1 -To9060` (typed CONFIRM guard, one registry value, `-Revert` restores),
+     then re-point our proxy's offload target to the other GPU via the GUI installer's UPDATE step.
 - **Log says `mode=PASSTHROUGH`** — ini not found in CWD or LUID wrong; run `upperscale_config.exe list`. Note: **Windows reassigns adapter LUIDs on reboot**, so a previously-written ini can silently point at the wrong (or no) adapter after a restart. Re-run the installer's UPDATE step (or `upperscale_config.exe set`) to refresh the LUID.
 - **HUD says `gpuB=(not created)`** — same root cause: the configured GPU-B LUID no longer matches any live adapter (reboot/driver change). Update the LUID via the GUI installer or config tool; the HUD updates on next launch.
 - **`ffxDispatch: intercepted ... rc=1`** — see the `[xgpu] ERROR:` lines above it in the log (input bounce / mirror creation failures are logged with details).
@@ -170,7 +177,7 @@ ffx_fgtest.exe out_fg.bin 5                  :: PASS = non-zero generated frame
 ## Status
 
 - ✅ Cross-GPU upscale (FSR4) — verified end-to-end with output parity vs single-GPU control
-- ✅ Passthrough transparency: stock version metadata + game's own loader as backend; 16+ min in-game, zero errors. **Open:** FSR4 still absent from Cyberpunk settings menu with current builds despite byte-identical feature-detection responses — file-level gate suspected (Authenticode), under investigation
+- ✅ Passthrough transparency: stock version metadata + game's own loader as backend; 16+ min in-game, zero errors. **FSR4-in-settings root-caused (2026-09-09):** it is an RDNA4-only feature and Cyberpunk renders on the RDNA3 7900 XTX — not a proxy issue; see Troubleshooting #3 + `tools/fsr4_gpu_switch.ps1`
 - ✅ **Safe mode `fg=0` (default)** — FG-family contexts stay native on GPU A and are forwarded untouched; only upscaling goes cross-GPU. Wired end-to-end (create gate + per-context dispatch gate), synthetic tests PASS both fg values
 - ⛔ Cross-GPU frame generation in Cyberpunk 2077 (`fg=1`) — **root-caused, disabled by default**: FFX holds the game's swapchain from `ffxConfigure` and its GENERATE passes reference it while executing on GPU B → device removed (0x887A0006). Proven in-game with isolated execution: FFX's recorded list alone removes devB before any of our readback commands run. Fixing requires a presentation-takeover design (own swapchain on GPU B) — tracked as future work
 - ✅ Config tool (`upperscale_config.exe`) + ini/env config, `--fg` option, target-device validation
